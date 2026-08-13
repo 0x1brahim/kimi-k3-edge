@@ -17,6 +17,14 @@
  * disagree with the block-size formula, unknown types, int64 overflow. The engine's
  * numel-only checks are not enough for GGUF (a transposed matrix of equal numel
  * would pass them); this module is where that failure class dies.
+ *
+ * THREADING (P3 decision A): the Q8_0 and IQ1_S block loops are OpenMP block-
+ * parallel, #ifdef _OPENMP guarded so a non-OpenMP build compiles to exactly the
+ * scalar loop below. Parallelism is ONLY over whole quant blocks: block b reads
+ * its own bytes and writes its own dst range, so the per-block math (and every
+ * output byte) is identical at any thread count. Bit-identity vs the serial path
+ * is a hard acceptance contract, proven by tests/unit/test_gguf_par.c. A build
+ * without OpenMP compiles the pragma out and is byte-identical by construction.
  */
 #include "k3_gguf_dequant.h"
 
@@ -159,11 +167,22 @@ static int k3_deq_f32(const K3GgufTensor *t, K3GgufDeqOut out, void *dst)
 }
 
 /* Q8_0: block = ggml_half d + int8 qs[32]; y[j] = qs[j] * fp32(d).
- * Reference: dequantize_row_q8_0, ggml-quants.c:553. */
+ * Reference: dequantize_row_q8_0, ggml-quants.c:553.
+ *
+ * BLOCK-PARALLEL (P3 decision A): block b reads only its own 34 bytes and
+ * writes only dst[b*32 .. b*32+32), so the loop is split at BLOCK boundaries
+ * with schedule(static) - the per-block math is untouched, and the output is
+ * byte-identical to the serial loop at any thread count. This is the trunk hot
+ * loop (56 G vals/token on the real model); test_gguf_par proves the
+ * bit-identity. The pragma is #ifdef _OPENMP guarded: a non-OpenMP build keeps
+ * the exact scalar loop. */
 static int k3_deq_q8_0(const K3GgufTensor *t, K3GgufDeqOut out, void *dst)
 {
     const int64_t nblk = t->nbytes / K3_GGUF_Q8_0_BSZ;
     const uint8_t *p = (const uint8_t *)t->data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int64_t b = 0; b < nblk; b++) {
         const uint8_t *blk = p + b * K3_GGUF_Q8_0_BSZ;
         const float d = k3_gguf_f16_to_f32(k3_rd16(blk));
@@ -180,11 +199,19 @@ static int k3_deq_q8_0(const K3GgufTensor *t, K3GgufDeqOut out, void *dst)
  *   idx   = qs[4*ib + l] | (((qh[ib] >> 3*l) & 7) << 8)   11-bit grid index
  *   y     = dl * (grid[idx][j] + delta)
  * Reference: dequantize_row_iq1_s, ggml-quants.c:2650; IQ1S_DELTA = 0.125f,
- * grid in iq1s_grid.h (verbatim from ggml-common.h:1135). */
+ * grid in iq1s_grid.h (verbatim from ggml-common.h:1135).
+ *
+ * BLOCK-PARALLEL (P3 decision A), same rationale as k3_deq_q8_0: block b
+ * reads only its own 50 bytes and writes only dst[b*256 .. b*256+256), so
+ * splitting the loop at block boundaries cannot change one output byte. This
+ * is the expert-admit hot loop (49 G vals/token). */
 static int k3_deq_iq1_s(const K3GgufTensor *t, K3GgufDeqOut out, void *dst)
 {
     const int64_t nblk = t->nbytes / K3_GGUF_IQ1_S_BSZ;
     const uint8_t *p = (const uint8_t *)t->data;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int64_t b = 0; b < nblk; b++) {
         const uint8_t *blk = p + b * K3_GGUF_IQ1_S_BSZ;
         const float d = k3_gguf_f16_to_f32(k3_rd16(blk));

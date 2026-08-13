@@ -107,7 +107,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
-              test_gguf_dequant test_gguf test_tok_gguf test_gguf_bind test_gguf_gate
+              test_gguf_dequant test_gguf_par test_gguf test_tok_gguf test_gguf_bind test_gguf_gate
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -157,6 +157,12 @@ $(BIN)/test_gguf_dequant: tests/unit/test_gguf_dequant.c \
                           $(BUILD)/src/core/k3_gguf_dequant.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_gguf_par: tests/unit/test_gguf_par.c \
+                    $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/test_gguf_bind: tests/unit/test_gguf_bind.c $(BUILD)/src/io/k3_gguf.o \
                     $(BUILD)/src/io/k3_st.o $(BUILD)/src/io/k3_gguf_map.o \
                     $(BUILD)/src/io/k3_gguf_expert.o $(BUILD)/src/core/k3_gguf_dequant.o \
@@ -202,7 +208,8 @@ test: $(TEST_BINS)
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
-	@echo "== gguf dequant ==";     ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
+	@echo "== gguf dequant ========";  ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
+	@echo "== gguf par bit-identity =";  ./$(BIN)/test_gguf_par $(FIXTURES)
 	@echo "== gguf reader ==";       ./$(BIN)/test_gguf
 	@echo "== gguf bind ==";         ./$(BIN)/test_gguf_bind $(FIXTURES)/mxfp4_quant_golden.bin
 	@echo "== gguf parity gates ==";  ./$(BIN)/test_gguf_gate $(FIXTURES)

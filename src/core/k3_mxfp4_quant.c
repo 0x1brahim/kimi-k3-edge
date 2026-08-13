@@ -13,6 +13,13 @@
  *
  * The 255 -> 0 rule of k3_mxfp4_dequant applies at DEQUANT time; the quantiser
  * itself emits whatever (exp + 127) wraps to, mirroring the python reference.
+ *
+ * THREADING (P3 decision A): the row loop is OpenMP row-parallel, #ifdef
+ * _OPENMP guarded so a non-OpenMP build compiles to exactly the scalar loop
+ * below. Parallelism is ONLY over whole rows: row r writes its own packed span
+ * and its own scales, so the per-group math inside a row (and every output
+ * byte) is identical at any thread count. Bit-identity vs the serial path is a
+ * hard acceptance contract, proven by tests/unit/test_gguf_par.c.
  */
 #include "k3_mxfp4_quant.h"
 
@@ -28,6 +35,13 @@ static int qfail(const char *what)
     return -1;
 }
 
+static void qfail_expo(int expo, int r, int gr)
+{
+    fprintf(stderr, "k3_mxfp4_quant: exponent %d is outside the E8M0 range "
+                    "-127..127 (row %d, group %d)\n",
+            expo, r, gr);
+}
+
 int k3_mxfp4_quant(unsigned char *packed, unsigned char *scales, const float *w, int rows,
                    int cols)
 {
@@ -41,6 +55,15 @@ int k3_mxfp4_quant(unsigned char *packed, unsigned char *scales, const float *w,
     static const uint8_t E2M1[8] = {0, 1, 2, 3, 4, 5, 6, 7}; /* LUT indices */
 
     const int g = cols / K3_MXFP4_GROUP;
+    /* ROW-PARALLEL (P3 decision A): row r writes only its own packed span
+     * [r*cols/2, (r+1)*cols/2) and its own scales[r*g .. r*g+g), and no row
+     * reads another row's output, so splitting the outer loop at ROW boundaries
+     * cannot change a single output byte; the per-group math inside a row is
+     * untouched. This is the expert-admit requant hot loop (49 G vals/token). */
+    int err = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int r = 0; r < rows; r++) {
         const float *row = w + (size_t)r * cols;
         for (int gr = 0; gr < g; gr++) {
@@ -66,11 +89,36 @@ int k3_mxfp4_quant(unsigned char *packed, unsigned char *scales, const float *w,
                 expo = (e - 1) - 2; /* floor(log2 amax) - 2 */
             }
             if (expo < -127 || expo > 127) {
-                fprintf(stderr,
-                        "k3_mxfp4_quant: exponent %d is outside the E8M0 range "
-                        "-127..127 (row %d, group %d)\n",
-                        expo, r, gr);
-                return -1;
+#ifdef _OPENMP
+                /* A return inside a parallel region would terminate the whole
+                 * process, not just the region (OpenMP unspecified behavior).
+                 * Record the failure with an atomic ticket instead: the first
+                 * finder reports, the rest stay silent, and the flag is read
+                 * back after the loop - the caller sees -1 either way.
+                 *
+                 * REACHABILITY: this guard is DEFENSIVE ONLY - it cannot fire
+                 * for any f32 input. amax is clamped to 1e-30 below, so expo
+                 * >= floor(log2(1e-30)) - 2 = -102, and fabsf(f32) <= FLT_MAX
+                 * ~ 2^128, so expo <= floor(log2(FLT_MAX)) - 2 = 125. The
+                 * range [-102, 125] is strictly inside [-127, 127], which is
+                 * why no test can exercise this branch (a |x| >= 2^130 or
+                 * 1e-30 <= |x| < 2^-125 trigger value does not exist in f32).
+                 * Kept fail-loud anyway: if the clamp or input domain ever
+                 * changes, this is where the invariant dies loudly. */
+                int ticket;
+#pragma omp atomic capture
+                ticket = err++;
+                if (ticket == 0) qfail_expo(expo, r, gr);
+#else
+                if (!err) qfail_expo(expo, r, gr);
+                err = 1;
+#endif
+                /* Both branches RUN THE LOOP TO COMPLETION: groups after the
+                 * failing one are still written, so on -1 the caller must
+                 * discard the buffers (it does: fill_slot releases the slot).
+                 * On the parallel path the reported (row, group) is the first
+                 * FINDER, not the first in row-major order. */
+                continue;
             }
             scales[r * g + gr] = (unsigned char)((expo + 127) & 0xFF);
 
@@ -123,5 +171,6 @@ int k3_mxfp4_quant(unsigned char *packed, unsigned char *scales, const float *w,
             }
         }
     }
+    if (err) return -1;
     return 0;
 }
