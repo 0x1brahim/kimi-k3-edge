@@ -93,7 +93,9 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
 
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
+              src/core/k3_gguf_dequant.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
+              src/io/k3_gguf.c \
               src/cache/k3_cache.c \
               src/model/k3_bind.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
@@ -102,7 +104,8 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model
+UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
+              test_gguf_dequant
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -144,6 +147,10 @@ $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
 $(BIN)/test_st: tests/unit/test_st.c $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_gguf_dequant: tests/unit/test_gguf_dequant.c \
+                          $(BUILD)/src/core/k3_gguf_dequant.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
@@ -169,6 +176,7 @@ test: $(TEST_BINS)
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+	@echo "== gguf dequant ==";     ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \

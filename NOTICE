@@ -37,6 +37,10 @@ MODIFICATIONS
     tok_unicode_o200k.h   Header comment corrected to name the regex family rather than
              a specific model. No functional change.
 
+  src/core/iq1s_grid.h is a lookup table dumped verbatim from llama.cpp
+  (ggml-common.h, the iq1s_grid table), licensed under the MIT License
+  (Copyright (c) 2023 Georgi Gerganov). See the provenance comment in the file.
+
   src/tokenizer/k3_tok.h is original work, not vendored. It populates the tok.h
   structures directly from the released tiktoken.model and tokenizer_config.json, so no
   intermediate tokenizer.json conversion step is required.
