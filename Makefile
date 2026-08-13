@@ -105,7 +105,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
-              test_gguf_dequant test_gguf
+              test_gguf_dequant test_gguf test_tok_gguf
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -155,6 +155,12 @@ $(BIN)/test_gguf_dequant: tests/unit/test_gguf_dequant.c \
                           $(BUILD)/src/core/k3_gguf_dequant.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# The GGUF tokenizer test links the wave-1 gguf reader (POSIX, so not the portable
+# C99 rule above). Its synthetic fixtures run everywhere; the real-file gate SKIPs
+# when the model directory is absent, so `make test` stays weightless-green.
+$(BIN)/test_tok_gguf: tests/unit/test_tok_gguf.c $(BUILD)/src/io/k3_gguf.o | $(BIN)
+	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@
+
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
@@ -187,7 +193,7 @@ test: $(TEST_BINS)
 	  for f in no_layermap bad_layer_index bad_topk; do \
 	      ./$(BIN)/test_cfg reject $(FIXTURES)/cfg/$$f.json || exit 1; \
 	  done
-	@echo "== tokenizer =="; \
+	@echo "== tokenizer ==========="; \
 	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	      ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c; \
 	  else \
@@ -195,7 +201,8 @@ test: $(TEST_BINS)
 	      echo "           the vocabulary ships with the checkpoint, not with this"; \
 	      echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
 	  fi
-	@echo "== real dimensions ==";   ./$(BIN)/scale_test
+	@echo "== gguf tokenizer ======"; ./$(BIN)/test_tok_gguf
+	@echo "== real dimensions =======";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
@@ -222,6 +229,14 @@ $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)
 ## tok: tokenizer parity against the reference implementation
 tok: $(BIN)/test_tok
 	@$(PYTHON) tools/tok_parity.py ./$(BIN)/test_tok
+
+## tok-gguf: the GGUF-metadata tokenizer against the tiktoken oracle. Needs the
+## real shard set (K3_GGUF_REAL) and the HF tokenizer files (K3_TOK_FILES); both
+## default to the local unsloth checkout.
+tok-gguf: $(BIN)/test_tok_gguf
+	@K3_GGUF_REAL=$${K3_GGUF_REAL:-/workspace/unsloth/Kimi-K3-GGUF/UD-IQ1_S} \
+	 K3_TOK_FILES=$${K3_TOK_FILES:-/workspace/unsloth/Kimi-K3-GGUF} \
+	 $(PYTHON) tools/tok_parity_gguf.py ./$(BIN)/test_tok_gguf
 
 ## cfg: config reader against both supported config layouts
 cfg: $(BIN)/test_cfg

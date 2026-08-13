@@ -391,13 +391,20 @@ typedef struct {
     uint16_t  split_count;
     int32_t   split_tensors;
     int       have_split;      /* all three split keys seen in this shard's walk */
+    int       split_synth;     /* keys synthesized for a single file (no splits) */
 } ShardMeta;
 
 /* Pass 1: header + metadata walk. Stores the shard-1 KV table in g (all shards are
  * walked into it; the non-zero split.no shards discard theirs afterwards). The
  * split keys are captured from the CURRENT shard's own walk, never from the merged
- * table: a lookup in g->kv would find shard 1's values for every shard. */
-static int parse_metadata(K3Gguf *g, Rdr *r, uint64_t nkv, ShardMeta *m)
+ * table: a lookup in g->kv would find shard 1's values for every shard.
+ *
+ * split_optional: a single-file gguf legitimately carries no split keys (the
+ * spec's sharding is a llama.cpp convention); k3_gguf_open_file passes 1 and a
+ * missing set is synthesized from the file itself. In a multi-shard directory
+ * open (0) a missing or partial set is a hard error. */
+static int parse_metadata(K3Gguf *g, Rdr *r, uint64_t nkv, ShardMeta *m,
+                          int split_optional)
 {
     /* Indices [nkv_before, g->nkv) hold THIS shard's own records (the earlier
      * shards' tables were discarded), so a duplicate key within one shard is a
@@ -450,10 +457,17 @@ static int parse_metadata(K3Gguf *g, Rdr *r, uint64_t nkv, ShardMeta *m)
     }
     m->kv_end = r->pos;
 
-    if (m->have_split != 3)
+    if (m->have_split == 0 && split_optional) {
+        /* Single file with no split keys: synthesize the trivial set. */
+        m->split_no = 0;
+        m->split_count = 1;
+        m->split_tensors = (int32_t)m->tensor_count;
+        m->split_synth = 1;
+    } else if (m->have_split != 3) {
         return gerr(r->path, r->pos,
                     "missing or mistyped split key (need split.no:u16, split.count:u16, "
                     "split.tensors.count:i32)");
+    }
     return 0;
 }
 
@@ -631,45 +645,23 @@ static uint64_t fnv1a(const char *s)
     return h;
 }
 
-int k3_gguf_open(K3Gguf *g, const char *dir)
+/* Everything after file discovery. Both k3_gguf_open (directory of shards) and
+ * k3_gguf_open_file (one file) land here with the file list already built and
+ * sorted (single-file lists trivially so). split_optional relaxes the split-key
+ * requirement for a one-file set. */
+static int gguf_open_indexed(K3Gguf *g, char **files, int nf, int split_optional)
 {
-    memset(g, 0, sizeof *g);
-
-    DIR *d = opendir(dir);
-    if (!d) { fprintf(stderr, "k3_gguf: cannot open directory %s\n", dir); return -1; }
-
-    char **files = NULL;
-    int nf = 0, cf = 0;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        size_t n = strlen(e->d_name);
-        if (n < 5 || strcmp(e->d_name + n - 5, ".gguf")) continue;
-        if (nf == cf) {
-            cf = cf ? cf * 2 : 16;
-            files = (char **)realloc(files, (size_t)cf * sizeof *files);
-        }
-        size_t len = strlen(dir) + 1 + n + 1;
-        files[nf] = (char *)malloc(len);
-        if (!files[nf]) { fprintf(stderr, "k3_gguf: out of memory\n"); goto bad_files; }
-        snprintf(files[nf], len, "%s/%s", dir, e->d_name);
-        nf++;
-    }
-    closedir(d);
-
-    if (nf == 0) {
-        fprintf(stderr, "k3_gguf: no .gguf files in %s\n", dir);
-        goto bad_files;
-    }
-    /* Sort so shard indices are stable: -NNNNN-of-MMMMM names sort in shard order. */
-    qsort(files, nf, sizeof *files, cmp_str);
-
     g->path = files;
     g->nshard = nf;
     g->fd = (int *)malloc((size_t)nf * sizeof(int));
     g->dfd = (int *)malloc((size_t)nf * sizeof(int));
     g->shard_kv = (int *)malloc((size_t)nf * sizeof(int));
+    /* -1/0 per array right after ITS malloc: k3_gguf_close on a partial-malloc
+     * failure would otherwise close garbage fd values (crit-d-2 #6). */
+    if (g->fd) for (int i = 0; i < nf; i++) g->fd[i] = -1;
+    if (g->dfd) for (int i = 0; i < nf; i++) g->dfd[i] = -1;
+    if (g->shard_kv) for (int i = 0; i < nf; i++) g->shard_kv[i] = 0;
     if (!g->fd || !g->dfd || !g->shard_kv) { k3_gguf_close(g); return -1; }
-    for (int i = 0; i < nf; i++) { g->fd[i] = -1; g->dfd[i] = -1; g->shard_kv[i] = 0; }
 
     ShardMeta *meta = (ShardMeta *)calloc((size_t)nf, sizeof *meta);
     if (!meta) { k3_gguf_close(g); return -1; }
@@ -725,7 +717,7 @@ int k3_gguf_open(K3Gguf *g, const char *dir)
         g->shard_kv[i] = (int)meta[i].kv_count;
         size_t wm = g->alen;                 /* discard point for non-shard-0 tables */
         int nkv_before = g->nkv;
-        if (parse_metadata(g, &r, meta[i].kv_count, &meta[i])) {
+        if (parse_metadata(g, &r, meta[i].kv_count, &meta[i], split_optional)) {
             rdr_free(&r);
             goto fail;
         }
@@ -749,7 +741,10 @@ int k3_gguf_open(K3Gguf *g, const char *dir)
                  meta[i].split_no, i);
             goto fail;
         }
-        if (meta[i].split_tensors <= 0 || meta[i].split_tensors > (1 << 20)) {
+        /* A synthesized count comes from this file's own (already capped)
+         * tensor_count and may legitimately be 0: a vocab-only single file. */
+        if (!meta[i].split_synth &&
+            (meta[i].split_tensors <= 0 || meta[i].split_tensors > (1 << 20))) {
             gerr(files[i], 0, "declares an implausible split.tensors.count %d",
                  meta[i].split_tensors);
             goto fail;
@@ -848,10 +843,80 @@ fail:
     free(meta);
     k3_gguf_close(g);
     return -1;
+}
+
+int k3_gguf_open(K3Gguf *g, const char *dir)
+{
+    memset(g, 0, sizeof *g);
+
+    DIR *d = opendir(dir);
+    if (!d) { fprintf(stderr, "k3_gguf: cannot open directory %s\n", dir); return -1; }
+
+    char **files = NULL;
+    int nf = 0, cf = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < 5 || strcmp(e->d_name + n - 5, ".gguf")) continue;
+        if (nf == cf) {
+            cf = cf ? cf * 2 : 16;
+            files = (char **)realloc(files, (size_t)cf * sizeof *files);
+        }
+        size_t len = strlen(dir) + 1 + n + 1;
+        files[nf] = (char *)malloc(len);
+        if (!files[nf]) { fprintf(stderr, "k3_gguf: out of memory\n"); goto bad_files; }
+        snprintf(files[nf], len, "%s/%s", dir, e->d_name);
+        nf++;
+    }
+    closedir(d);
+
+    if (nf == 0) {
+        fprintf(stderr, "k3_gguf: no .gguf files in %s\n", dir);
+        goto bad_files;
+    }
+    /* Sort so shard indices are stable: -NNNNN-of-MMMMM names sort in shard order. */
+    qsort(files, nf, sizeof *files, cmp_str);
+    return gguf_open_indexed(g, files, nf, 0);
 
 bad_files:
     if (files) { for (int i = 0; i < nf; i++) free(files[i]); free(files); }
     return -1;
+}
+
+int k3_gguf_open_file(K3Gguf *g, const char *file)
+{
+    memset(g, 0, sizeof *g);
+    char **files = (char **)malloc(sizeof *files);
+    if (!files) { fprintf(stderr, "k3_gguf: out of memory\n"); return -1; }
+    files[0] = (char *)malloc(strlen(file) + 1);
+    if (!files[0]) {
+        free(files);
+        fprintf(stderr, "k3_gguf: out of memory\n");
+        return -1;
+    }
+    strcpy(files[0], file);
+    return gguf_open_indexed(g, files, 1, 1);
+}
+
+int k3_gguf_probe(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) return 0;
+        int found = 0;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            size_t n = strlen(e->d_name);
+            if (n >= 5 && !strcmp(e->d_name + n - 5, ".gguf")) { found = 1; break; }
+        }
+        closedir(d);
+        return found;
+    }
+    if (!S_ISREG(st.st_mode)) return 0;
+    size_t n = strlen(path);
+    return n >= 5 && !strcmp(path + n - 5, ".gguf");
 }
 
 void k3_gguf_close(K3Gguf *g)
@@ -912,6 +977,249 @@ const K3GgufKV *k3_gguf_kv(const K3Gguf *g, const char *key)
     for (int i = 0; i < g->nkv; i++)
         if (!strcmp(g->kv[i].key, key)) return &g->kv[i];
     return NULL;
+}
+
+/* ------------------------------------------------------------------ tokenizer */
+
+/* Copy a string array's OFFSETS into one growing blob. The caller resolves the
+ * offsets into pointers only after EVERY array is collected: the blob reallocs
+ * as it grows, which MOVES it, so a pointer taken mid-walk dangles after the
+ * next realloc (this bit the first version: the merges collection moved the
+ * blob under the already-resolved tokens pointers). Every string must be
+ * NUL-free (an embedded NUL would truncate a vocab key in the hash table and
+ * silently change the tokenizer). Mirrors walk_value's bounds discipline:
+ * length-capped, file-size-checked, misalignment fails. Returns a malloc'd
+ * offset array (caller frees), or NULL on any violation. */
+static size_t *tok_str_offsets(Rdr *r, size_t *nout, char **blob,
+                               size_t *bn, size_t *bcap)
+{
+    uint32_t et;
+    uint64_t n;
+    if (rdr_u32(r, &et) || rdr_u64(r, &n)) return NULL;
+    if (et != G_T_STRING) return NULL;
+    if (n == 0 || n > (1u << 22)) return NULL;
+    size_t *offs = (size_t *)malloc((size_t)n * sizeof(size_t));
+    if (!offs) return NULL;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t sl;
+        if (rdr_u64(r, &sl)) { free(offs); return NULL; }
+        if (sl > r->fsize || sl > (1u << 24) || sl == 0) { free(offs); return NULL; }
+        if (rdr_need(r, (size_t)sl)) { free(offs); return NULL; }
+        if (memchr(r->buf + r->pos, 0, (size_t)sl)) { free(offs); return NULL; }
+        size_t off = *bn;
+        if (sl > SIZE_MAX - off - 1) { free(offs); return NULL; }
+        if (off + sl + 1 > *bcap) {
+            size_t nc = *bcap ? *bcap : (1 << 20);
+            while (off + sl + 1 > nc) nc *= 2;
+            char *nb = (char *)realloc(*blob, nc);
+            if (!nb) { free(offs); return NULL; }
+            *blob = nb;
+            *bcap = nc;
+        }
+        memcpy(*blob + off, r->buf + r->pos, (size_t)sl);
+        (*blob)[off + sl] = '\0';
+        offs[i] = off;
+        *bn = off + sl + 1;
+        r->pos += (size_t)sl;
+    }
+    *nout = (size_t)n;
+    return offs;
+}
+
+static char **tok_resolve(const size_t *offs, size_t n, const char *blob)
+{
+    char **arr = (char **)malloc(n * sizeof(char *));
+    if (!arr) return NULL;
+    for (size_t i = 0; i < n; i++) arr[i] = (char *)blob + offs[i];
+    return arr;
+}
+
+int k3_gguf_tok(const K3Gguf *g, K3GgufTok *t)
+{
+    memset(t, 0, sizeof *t);
+    if (g->nshard < 1 || !g->fd || g->fd[0] < 0 || !g->path) {
+        fprintf(stderr, "k3_gguf: tokenizer extraction needs an open shard set\n");
+        return -1;   /* r is not initialized yet: cannot reach tok_fail */
+    }
+    struct stat st;
+    if (fstat(g->fd[0], &st) != 0 || st.st_size < 24) {
+        fprintf(stderr, "k3_gguf: cannot size shard 1 for the tokenizer walk\n");
+        return -1;
+    }
+    Rdr r;
+    /* Declared before the first goto tok_fail: the rdr_init failure path below
+     * jumps past later initializers, and tok_fail frees these unconditionally. */
+    char *blob = NULL;
+    size_t bn = 0, bcap = 0;
+    size_t *offs_tokens = NULL, *offs_merges = NULL;
+    size_t n_tokens = 0, n_merges = 0;
+    if (rdr_init(&r, g->path[0], g->fd[0], (uint64_t)st.st_size)) {
+        fprintf(stderr, "k3_gguf: out of memory on the tokenizer walk\n");
+        goto tok_fail;
+    }
+    /* One cleanup for every failure after this point: k3_gguf_tok_free is
+     * NULL-safe and releases ttype/tokens/merges/strblob (whichever were
+     * allocated); blob is freed directly until it is adopted as t->strblob. */
+    /* The open already validated magic and version; re-checking is one pread and
+     * keeps this walk self-contained. */
+    if (rdr_need(&r, 24) || memcmp(r.buf, "GGUF", 4) != 0) {
+        fprintf(stderr, "k3_gguf: %s: bad magic on the tokenizer walk\n", g->path[0]);
+        goto tok_fail;
+    }
+    r.pos = 24;   /* magic, version, tensor_count, kv_count */
+
+    const uint64_t nkv = (uint64_t)g->shard_kv[0];
+    for (uint64_t i = 0; i < nkv; i++) {
+        char key[64];
+        size_t klen = 0;
+        if (rdr_str(&r, key, sizeof key, &klen, 1)) {
+            fprintf(stderr, "k3_gguf: %s @+%llu: tokenizer walk: bad key %llu of %llu\n",
+                    g->path[0], (unsigned long long)r.pos,
+                    (unsigned long long)i, (unsigned long long)nkv);
+            goto tok_fail;
+        }
+        uint32_t vt;
+        if (rdr_u32(&r, &vt)) {
+            fprintf(stderr, "k3_gguf: %s: truncated value type on key '%s'\n",
+                    g->path[0], key);
+            goto tok_fail;
+        }
+        if (vt > G_T_F64) {
+            fprintf(stderr, "k3_gguf: %s: unknown value type %u on key '%s'\n",
+                    g->path[0], vt, key);
+            goto tok_fail;
+        }
+        int bad = 0;
+        if (!strcmp(key, "tokenizer.ggml.tokens")) {
+            if (offs_tokens) bad = 1;
+            else offs_tokens = tok_str_offsets(&r, &n_tokens, &blob, &bn, &bcap);
+            if (!offs_tokens) bad = 1;
+        } else if (!strcmp(key, "tokenizer.ggml.merges")) {
+            if (offs_merges) bad = 1;
+            else offs_merges = tok_str_offsets(&r, &n_merges, &blob, &bn, &bcap);
+            if (!offs_merges) bad = 1;
+        } else if (!strcmp(key, "tokenizer.ggml.token_type")) {
+            /* The D7 quirk: elements are declared as type 5 (int32) and are 4
+             * bytes each on the wire. Verified byte-level on the real file. */
+            uint32_t et;
+            uint64_t n;
+            if (t->ttype || rdr_u32(&r, &et) || rdr_u64(&r, &n) || et != G_T_I32 ||
+                n == 0 || n > (1u << 22) || n > r.fsize / 4)
+                bad = 1;
+            else {
+                if (rdr_need(&r, (size_t)n * 4)) { bad = 1; }
+                else {
+                    t->ttype = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+                    if (!t->ttype) { bad = 1; }
+                    else {
+                        memcpy(t->ttype, r.buf + r.pos, (size_t)n * 4);
+                        t->nttype = (int)n;
+                        r.pos += (size_t)n * 4;
+                    }
+                }
+            }
+        } else {
+            Val v;
+            if (walk_value(&r, vt, &v, 0)) bad = 1;
+        }
+        if (bad) {
+            fprintf(stderr, "k3_gguf: %s @+%llu: bad value of type %u on key '%s'\n",
+                    g->path[0], (unsigned long long)r.pos, vt, key);
+            goto tok_fail;
+        }
+        if (!boundary_ok(&r)) {
+            fprintf(stderr, "k3_gguf: %s @+%llu: tokenizer walk misaligned after key "
+                            "'%s'\n", g->path[0], (unsigned long long)r.pos, key);
+            goto tok_fail;
+        }
+    }
+    rdr_free(&r);
+    r.buf = NULL;   /* the cleanup's rdr_free must not see the freed buffer */
+    if (!offs_tokens || !offs_merges || !t->ttype) {
+        fprintf(stderr, "k3_gguf: %s: tokenizer section is missing tokens, merges or "
+                        "token_type\n", g->path[0]);
+        goto tok_fail;
+    }
+    t->ntok = (int)n_tokens;
+    t->nmerges = (int)n_merges;
+    if (t->nttype != t->ntok) {
+        fprintf(stderr, "k3_gguf: %s: token_type has %d entries but tokens has %d\n",
+                g->path[0], t->nttype, t->ntok);
+        goto tok_fail;
+    }
+    /* Resolve AFTER every collection: the blob is stable now, so these pointers
+     * survive (the blob moves during collection, which is why the offsets were
+     * kept instead). */
+    t->tokens = tok_resolve(offs_tokens, n_tokens, blob);
+    t->merges = tok_resolve(offs_merges, n_merges, blob);
+    free(offs_tokens);
+    free(offs_merges);
+    offs_tokens = NULL;
+    offs_merges = NULL;   /* the cleanup must not free these again */
+    if (!t->tokens || !t->merges) {
+        fprintf(stderr, "k3_gguf: %s: out of memory resolving tokenizer arrays\n",
+                g->path[0]);
+        goto tok_fail;
+    }
+    t->strblob = blob;   /* owned by the caller from here on */
+
+    /* Scalar keys come from the already-validated open-time table. */
+    const K3GgufKV *k;
+    k = k3_gguf_kv(g, "tokenizer.ggml.model");
+    if (!k || k->type != G_T_STRING || k->v.s.n == 0 || k->v.s.n >= sizeof t->model) {
+        fprintf(stderr, "k3_gguf: %s: tokenizer.ggml.model missing or mistyped\n",
+                g->path[0]);
+        goto tok_fail;
+    }
+    memcpy(t->model, k->v.s.p, k->v.s.n);
+    t->model[k->v.s.n] = '\0';
+    k = k3_gguf_kv(g, "tokenizer.ggml.pre");
+    if (!k || k->type != G_T_STRING || k->v.s.n == 0 || k->v.s.n >= sizeof t->pre) {
+        fprintf(stderr, "k3_gguf: %s: tokenizer.ggml.pre missing or mistyped\n",
+                g->path[0]);
+        goto tok_fail;
+    }
+    memcpy(t->pre, k->v.s.p, k->v.s.n);
+    t->pre[k->v.s.n] = '\0';
+    k = k3_gguf_kv(g, "kimi-k3.vocab_size");
+    if (!k || k->type != G_T_U32) {
+        fprintf(stderr, "k3_gguf: %s: kimi-k3.vocab_size missing or mistyped\n",
+                g->path[0]);
+        goto tok_fail;
+    }
+    t->vocab_size = (uint32_t)k->v.u;
+    if (t->vocab_size != (uint32_t)t->ntok) {
+        fprintf(stderr, "k3_gguf: %s: kimi-k3.vocab_size %u != %d tokens\n",
+                g->path[0], t->vocab_size, t->ntok);
+        goto tok_fail;
+    }
+    k = k3_gguf_kv(g, "tokenizer.ggml.bos_token_id");
+    if (k && k->type == G_T_U32) { t->bos_id = (uint32_t)k->v.u; t->have_bos = 1; }
+    k = k3_gguf_kv(g, "tokenizer.ggml.eos_token_id");
+    if (k && k->type == G_T_U32) { t->eos_id = (uint32_t)k->v.u; t->have_eos = 1; }
+    k = k3_gguf_kv(g, "tokenizer.ggml.padding_token_id");
+    if (k && k->type == G_T_U32) { t->pad_id = (uint32_t)k->v.u; t->have_pad = 1; }
+
+    /* The blob is owned by the caller (the tokenizer bootstrap adopts it; the
+     * strings it references live for the life of the process). */
+    return 0;
+
+tok_fail:
+    free(offs_tokens);
+    free(offs_merges);
+    if (t->strblob == NULL) free(blob);   /* not yet adopted: release it raw */
+    rdr_free(&r);
+    k3_gguf_tok_free(t);   /* NULL-safe; frees ttype/tokens/merges/strblob */
+    return -1;
+}
+
+void k3_gguf_tok_free(K3GgufTok *t)
+{
+    free(t->tokens);
+    free(t->merges);
+    free(t->ttype);
+    free(t->strblob);
+    memset(t, 0, sizeof *t);
 }
 
 /* ------------------------------------------------------------------ config */

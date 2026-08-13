@@ -96,7 +96,19 @@ typedef struct {
  * every tensor info. Returns 0 on success, -1 with a context-rich message on any
  * violation. */
 int  k3_gguf_open(K3Gguf *g, const char *dir);
+
+/* Open ONE .gguf file as a one-shard set (single-file checkpoints have no split
+ * keys at all; the spec's sharding is a llama.cpp convention). Split keys, when
+ * present, are still validated; when absent they are tolerated for this single
+ * file only. Multi-shard directories must go through k3_gguf_open, where a
+ * missing split key is a hard error. */
+int  k3_gguf_open_file(K3Gguf *g, const char *file);
 void k3_gguf_close(K3Gguf *g);
+
+/* 1 when path is a .gguf file or a directory holding at least one *.gguf file,
+ * 0 otherwise. Cheap (stat + one readdir); the CLI uses it to route --tok and
+ * the model dir before committing to either reader. */
+int  k3_gguf_probe(const char *path);
 
 /* O(1) lookup; NULL when absent (callers must treat that as fatal). */
 const K3Tensor *k3_gguf_find(const K3Gguf *g, const char *name);
@@ -106,6 +118,54 @@ int64_t k3_gguf_read(const K3Gguf *g, const K3Tensor *t, void *buf);
 
 /* Shard-1 metadata lookup, or NULL. */
 const K3GgufKV *k3_gguf_kv(const K3Gguf *g, const char *key);
+
+/* ------------------------------------------------------------------ tokenizer --
+ * D6: materialize the shard-1 tokenizer keys. The open-time walk deliberately
+ * discards the big string arrays (see the K3GgufKV comment); this is the
+ * dedicated reader that promise was made to. It re-walks shard 1's metadata
+ * section (bounded: 6.9 MB) with the same quirk handling and per-value boundary
+ * verification as the open, and returns exactly the keys the tokenizer
+ * bootstrap consumes:
+ *
+ *   tokenizer.ggml.model      must be a string; the loader requires "gpt2"
+ *   tokenizer.ggml.pre        must be a string; the loader requires "kimi-k2"
+ *   tokenizer.ggml.tokens     array<string>; every string is NUL-terminated and
+ *                             contains no NUL; ALREADY the GPT-2 byte-level form
+ *                             the Tok vocab hashes on (verified: no base64, no
+ *                             bytelevel conversion)
+ *   tokenizer.ggml.merges     array<string> "left right" pairs, byte-level too
+ *   tokenizer.ggml.token_type array of type-5 elements (the D7 quirk: 4 bytes
+ *                             each); verified values are 1 = NORMAL and
+ *                             3 = CONTROL
+ *   tokenizer.ggml.{bos,eos,padding}_token_id   uint32
+ *   kimi-k3.vocab_size        uint32, must equal len(tokens)
+ *
+ * Anything else in the section is walked and validated, then skipped. A missing
+ * or mistyped key, a count mismatch, a malformed string or a misaligned walk is
+ * a hard error with file+offset context (the same fail-loud class as the open).
+ *
+ * OWNERSHIP: all strings live in one contiguous blob; tokens[]/merges[] are
+ * pointers into it. k3_tok_load_gguf ADOPTS the arrays (the Tok struct
+ * references the strings for the life of the process, exactly as the
+ * tiktoken.model loader does). Callers that only inspect must k3_gguf_tok_free.
+ * Returns 0 and fills *t, or prints and returns -1. */
+typedef struct {
+    char  **tokens;            /* tokenizer.ggml.tokens (byte-level strings)  */
+    int     ntok;
+    char  **merges;            /* tokenizer.ggml.merges ("l r" pairs)         */
+    int     nmerges;
+    int32_t *ttype;            /* tokenizer.ggml.token_type, per token         */
+    int     nttype;
+    char   *strblob;           /* the token/merge strings live here            */
+    char    model[16];         /* tokenizer.ggml.model                        */
+    char    pre[32];           /* tokenizer.ggml.pre                          */
+    uint32_t vocab_size;       /* kimi-k3.vocab_size                          */
+    uint32_t bos_id, eos_id, pad_id;
+    int      have_bos, have_eos, have_pad;
+} K3GgufTok;
+
+int  k3_gguf_tok(const K3Gguf *g, K3GgufTok *t);
+void k3_gguf_tok_free(K3GgufTok *t);
 
 /* Derive K3Cfg from the shard-1 kimi-k3.* keys (D5). fa receives the ONE-BASED MLA
  * layer list, as k3_cfg_load does; k3_is_mla() compares against layer+1. Returns 1
