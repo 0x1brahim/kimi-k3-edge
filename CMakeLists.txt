@@ -58,10 +58,13 @@ endif()
 add_library(k3 STATIC
   src/core/k3_ops.c
   src/core/k3_gguf_dequant.c
+  src/core/k3_mxfp4_quant.c
   src/io/k3_st.c
   src/io/k3_load.c
   src/io/k3_trunk.c
   src/io/k3_gguf.c
+  src/io/k3_gguf_map.c
+  src/io/k3_gguf_expert.c
   src/cache/k3_cache.c
   src/model/k3_bind.c)
 
@@ -101,6 +104,7 @@ k3_add_test(test_st     tests/unit/test_st.c)
 k3_add_test(test_gguf_dequant tests/unit/test_gguf_dequant.c)
 k3_add_test(test_gguf    tests/unit/test_gguf.c)
 k3_add_test(test_tok_gguf tests/unit/test_tok_gguf.c)
+k3_add_test(test_gguf_bind tests/unit/test_gguf_bind.c)
 k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
 k3_add_test(scale_test  tests/unit/scale_test.c)
@@ -132,8 +136,10 @@ add_test(NAME safetensors COMMAND test_st   ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR
 add_test(NAME gguf_dequant COMMAND test_gguf_dequant ${FIX}/gguf_dequant_golden.bin)
 add_test(NAME gguf        COMMAND test_gguf)
 add_test(NAME gguf_tokenizer COMMAND test_tok_gguf)
+add_test(NAME gguf_bind   COMMAND test_gguf_bind ${FIX}/mxfp4_quant_golden.bin)
 set_tests_properties(gguf PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 set_tests_properties(gguf_tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
+set_tests_properties(gguf_bind PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 
 # The tokenizer test needs the released vocabulary, which is not in this repository.
 # Registered UNCONDITIONALLY so ctest reports it as Skipped rather than omitting it:

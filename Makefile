@@ -94,8 +94,10 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
               src/core/k3_gguf_dequant.c \
+              src/core/k3_mxfp4_quant.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
               src/io/k3_gguf.c \
+              src/io/k3_gguf_map.c src/io/k3_gguf_expert.c \
               src/cache/k3_cache.c \
               src/model/k3_bind.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
@@ -105,7 +107,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
-              test_gguf_dequant test_gguf test_tok_gguf
+              test_gguf_dequant test_gguf test_tok_gguf test_gguf_bind
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -155,16 +157,23 @@ $(BIN)/test_gguf_dequant: tests/unit/test_gguf_dequant.c \
                           $(BUILD)/src/core/k3_gguf_dequant.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-# The GGUF tokenizer test links the wave-1 gguf reader (POSIX, so not the portable
-# C99 rule above). Its synthetic fixtures run everywhere; the real-file gate SKIPs
-# when the model directory is absent, so `make test` stays weightless-green.
-$(BIN)/test_tok_gguf: tests/unit/test_tok_gguf.c $(BUILD)/src/io/k3_gguf.o | $(BIN)
-	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@
+$(BIN)/test_gguf_bind: tests/unit/test_gguf_bind.c $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/io/k3_gguf_map.o \
+                    $(BUILD)/src/io/k3_gguf_expert.o $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/model/k3_bind.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $< -o $@
+
+# The GGUF tokenizer test links the wave-1 gguf reader (POSIX, so not the portable
+# C99 rule above). Its synthetic fixtures run everywhere; the real-file gate SKIPs
+# when the model directory is absent, so `make test` stays weightless-green.
+$(BIN)/test_tok_gguf: tests/unit/test_tok_gguf.c $(BUILD)/src/io/k3_gguf.o | $(BIN)
+	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
@@ -188,6 +197,7 @@ test: $(TEST_BINS)
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
 	@echo "== gguf dequant ==";     ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
 	@echo "== gguf reader ==";       ./$(BIN)/test_gguf
+	@echo "== gguf bind ==";         ./$(BIN)/test_gguf_bind $(FIXTURES)/mxfp4_quant_golden.bin
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \
@@ -202,7 +212,7 @@ test: $(TEST_BINS)
 	      echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
 	  fi
 	@echo "== gguf tokenizer ======"; ./$(BIN)/test_tok_gguf
-	@echo "== real dimensions =======";   ./$(BIN)/scale_test
+	@echo "== real dimensions =====";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
