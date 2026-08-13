@@ -61,4 +61,4 @@ venv/
 !tests/fixtures/**
 # model weights
 unsloth/
-
+kimiVault/
