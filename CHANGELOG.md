@@ -5,6 +5,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **GGUF checkpoints, read directly**: the engine now runs from the unsloth UD-IQ1_S
+  shard set (or a single `.gguf` file) with no conversion and no pack step. A
+  shard-set reader (`src/io/k3_gguf.c`) indexes all 2,573 tensors of the 14-shard
+  594 GB file and derives the config from shard-1 metadata; the tokenizer loads from
+  shard-1 metadata too, so no `config.json`, no `tiktoken.model` and no `--tok` are
+  needed. (On a 1-bit-quantised checkpoint, greedy decoding — the engine's only
+  sampling mode — is expected to fall into repetitive loops; the README says so
+  plainly.)
+- **GGUF weight path**: the trunk is streamed per layer with Q8_0/F32 dequantised to
+  bf16 into one reusable layer buffer; the routed experts are dequantised from IQ1_S
+  and requantised to the engine's native MXFP4 at cache admit, so the existing
+  matmul kernels and expert cache serve both paths unchanged. The dequant/requant
+  hot loops are OpenMP-parallel with bit-identical output at any thread count.
+- **GGUF parity gates**: weightless tiny-fixture gates for the new path — argmax
+  113/113 within the repo budget on single and multi-shard fixtures (single vs
+  multi bit-identical), a bit-exact trunk sub-gate against the safetensors bytes,
+  and a 96/96 per-expert requant self-consistency gate (`test_gguf_gate`, `make
+  parity-tiny`, `make tok-gguf`).
+
 ## [1.0.0] - 2026-08-07
 
 Verified end to end on the full released checkpoint, and made substantially faster, with

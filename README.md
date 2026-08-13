@@ -140,6 +140,7 @@ component at a time.
   - [Exit codes](#exit-codes)
   - [Environment variables](#environment-variables)
   - [Worked examples](#worked-examples)
+  - [GGUF checkpoints](#gguf-checkpoints)
 - [Choosing a preset](#choosing-a-preset)
 - [Reading the run report](#reading-the-run-report)
 - [Common questions](#common-questions)
@@ -496,6 +497,41 @@ systemd-run --scope --user -q -p MemoryMax=8G -p MemorySwapMax=0 \
            --ids 1008,10484,318,15383,387 --gen 8 --incremental
 ```
 
+### GGUF checkpoints
+
+The engine also reads **GGUF shard sets directly** — notably the unsloth UD-IQ1_S
+releases of Kimi K3 — with no conversion and no pack step. Point it at the model
+directory; a single `.gguf` file is accepted too:
+
+```bash
+./bin/k3 /path/to/Kimi-K3-GGUF/UD-IQ1_S \
+         --prompt "Hi" --gen 20 --incremental \
+         --trunk-gb 3 --cache-gb 10
+```
+
+Four things to know:
+
+- **The config and the tokenizer come from shard-1 metadata.** There is no
+  `config.json` in a GGUF directory, so the engine reads the file's own `kimi-k3.*`
+  keys instead, and no `tiktoken.model` either — no `--tok` is needed (and
+  `--config` is refused on this path).
+- **The same streaming economics apply.** The trunk is streamed per layer and
+  dequantised to bf16 into one reusable layer buffer; the routed experts are
+  dequantised from IQ1_S and requantised to the engine's native MXFP4 at cache
+  admit, so the existing matmul kernels and the expert cache serve both paths
+  unchanged.
+- **Budgets work as usual.** On a 40 GB machine, `--trunk-gb 3 --cache-gb 10` plans
+  17.73 GB and measures 17.87 GB peak RSS. `--layers N` slices are for smoke-testing
+  the machinery only — the run itself prints that its output is NOT the full model.
+- **One honest caveat.** GGUF is a lossy, quantised checkpoint, and this engine is
+  greedy-only. Greedy sampling on a 1-bit-quantised checkpoint is expected to fall
+  into repetitive loops; that is the sampling regime, not an engine defect.
+
+The GGUF path is covered by the weightless parity gates — `make parity-tiny`,
+`test_gguf_gate` and `make tok-gguf` — which prove argmax-identical logits on single
+and multi-shard tiny fixtures within the repo budget, a bit-exact trunk sub-gate
+against the safetensors bytes, and a per-expert requant self-consistency gate.
+
 ## Choosing a preset
 
 ```console
@@ -581,6 +617,12 @@ hour in. Shorten the request, or drop `--incremental`, which carries no KV cache
 
 **Is the whole 1.56 TB needed?** For generation, yes. For development, no: `make test`
 needs nothing at all, and `--layers N` runs against partial shard sets.
+
+**Can I run from a GGUF checkpoint?** Yes — point the engine at a GGUF shard directory
+(or a single `.gguf` file) and both the config and the tokenizer come from shard-1
+metadata automatically: no pack step, no `config.json`, no `--tok`. See
+[GGUF checkpoints](#gguf-checkpoints) for the command and one honest caveat about
+quantised checkpoints and greedy decoding.
 
 **macOS, Windows, WSL?** The engine targets Linux. The tokenizer and config reader are
 portable C99 and are built portably in CI.
