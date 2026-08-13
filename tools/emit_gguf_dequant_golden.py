@@ -186,10 +186,10 @@ def dequant_iq1_s(raw: bytes) -> np.ndarray:
             qhb = int(qh[ib])
             dl = d * np.float32(2 * ((qhb >> 12) & 7) + 1)
             delta = np.float32(-DELTA) if qhb & 0x8000 else np.float32(DELTA)
-            for l in range(4):
-                idx = int(qs[4 * ib + l]) | (((qhb >> (3 * l)) & 7) << 8)
+            for li in range(4):
+                idx = int(qs[4 * ib + li]) | (((qhb >> (3 * li)) & 7) << 8)
                 grid = GRID[idx * 8:(idx + 1) * 8].astype(np.float32)
-                y[i * QKI + 32 * ib + 8 * l: i * QKI + 32 * ib + 8 * (l + 1)] = (
+                y[i * QKI + 32 * ib + 8 * li: i * QKI + 32 * ib + 8 * (li + 1)] = (
                     (grid + delta) * dl)
     return y
 

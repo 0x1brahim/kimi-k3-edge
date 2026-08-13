@@ -107,7 +107,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
-              test_gguf_dequant test_gguf test_tok_gguf test_gguf_bind
+              test_gguf_dequant test_gguf test_tok_gguf test_gguf_bind test_gguf_gate
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -164,6 +164,13 @@ $(BIN)/test_gguf_bind: tests/unit/test_gguf_bind.c $(BUILD)/src/io/k3_gguf.o \
                     $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_gguf_gate: tests/unit/test_gguf_gate.c $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/io/k3_gguf_map.o \
+                    $(BUILD)/src/io/k3_gguf_expert.o $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/model/k3_bind.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
@@ -198,6 +205,7 @@ test: $(TEST_BINS)
 	@echo "== gguf dequant ==";     ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
 	@echo "== gguf reader ==";       ./$(BIN)/test_gguf
 	@echo "== gguf bind ==";         ./$(BIN)/test_gguf_bind $(FIXTURES)/mxfp4_quant_golden.bin
+	@echo "== gguf parity gates ==";  ./$(BIN)/test_gguf_gate $(FIXTURES)
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \
@@ -247,6 +255,15 @@ tok-gguf: $(BIN)/test_tok_gguf
 	@K3_GGUF_REAL=$${K3_GGUF_REAL:-/workspace/unsloth/Kimi-K3-GGUF/UD-IQ1_S} \
 	 K3_TOK_FILES=$${K3_TOK_FILES:-/workspace/unsloth/Kimi-K3-GGUF} \
 	 $(PYTHON) tools/tok_parity_gguf.py ./$(BIN)/test_tok_gguf
+
+## parity-tiny: PARITY GATE 1 on the committed tiny fixtures (ST path vs GGUF
+## path through bin/k3, same-bytes references, the bit-exact sub-gate and the
+## measured-encoding-noise bounds). Weightless: no real model needed.
+## Needs numpy: run as `make parity-tiny PYTHON=.venv/bin/python` when the
+## system python lacks the repo venv (same convention as the tok targets).
+parity-tiny: $(CLI_BIN) $(BIN)/test_gguf_gate
+	@$(PYTHON) tools/tiny_parity.py
+	@./$(BIN)/test_gguf_gate $(FIXTURES)
 
 ## cfg: config reader against both supported config layouts
 cfg: $(BIN)/test_cfg
