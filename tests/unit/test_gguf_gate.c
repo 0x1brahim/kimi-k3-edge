@@ -31,14 +31,16 @@
  *      composite kv_b reassembly, A_log with the zero tail, and the folded
  *      *_res_score pairs). The encodings MATCH, so any io bug would show as a
  *      bit difference here, with no quantization noise to hide behind.
- *   C. PARITY GATE 2 (D2 hard gate): the engine's expert admit+matmul chain
- *      (K3GgufExpertSrc -> k3_matmul_mxfp4 -> k3_situ_glu) compared per expert
- *      against the golden's fp32 reference (IQ1_S dequant -> fp32 matmul) and
- *      its requant mirror (dequant -> MXFP4 requant -> matmul). The engine must
- *      sit at the requant mirror within fp32 accumulation tolerance (tight
- *      bound), and its distance to the fp32 reference must stay within the
- *      golden's OWN measured requant noise class (2x + slack) - the D2
- *      self-consistency criterion. Router selections must match the golden's.
+ *   C. PARITY GATE 2 (fix-wave repair): the engine's NATIVE expert chain
+ *      (K3GgufExpertSrc -> k3_matmul_iq1_s -> k3_situ_glu) compared per
+ *      expert against the golden's RAW-dequant fp32 reference (independent
+ *      numpy IQ1_S dequant + fp32 matmul - NO requant anywhere in the
+ *      reference path) within a tight fp32-accumulation budget (~1e-6
+ *      measured, 1e-4 bound). The old D2 self-consistency gate (engine vs a
+ *      requant MIRROR of the same requant) was blind to the 13.3% mean
+ *      requant error the bake-off caught and is gone. Router selections must
+ *      match the golden's. A real-file leg (K3_GGUF_REAL) runs the same
+ *      comparison on bounded windows of REAL IQ1_S bytes.
  *   D. FULL-MODEL GATES: the complete 13-layer forward through the engine ops
  *      (k3_decoder_layer_inc) on (i) the ST fixture vs tiny_st/ref_logits.json,
  *      (ii) the single-shard GGUF vs its same-bytes reference, (iii) the
@@ -443,21 +445,27 @@ static void run_bit_exact_trunk(const char *st_dir, const char *gg_dir)
                "engine F32->bf16 dequant bit-exact vs ST (%s)", name);
         } else if (is_alog) {
             /* ST ships [kda_head_dim] with a zero tail; the GGUF ships
-             * [kda_heads]; the engine pads. The head prefix must match and the
-             * ST tail must be zero. */
+             * [kda_heads] in the FOLDED form ssm_a = -exp(A_log) (unsloth
+             * converter fold, kimi_k3.py:333-336), which the engine's map
+             * unfolds at bind. Here the raw BYTES must be consistent: every
+             * GGUF value equals -exp(ST value) (fp32, tolerance for libm
+             * expf rounding) and the ST tail must be zero. */
             int same = 1;
             for (int64_t j = 0; j < c.kda_heads; j++) {
                 float a, b;
                 memcpy(&a, stbuf + 4 * j, 4);
                 memcpy(&b, raw + 4 * j, 4);
-                if (memcmp(&a, &b, 4) != 0) same = 0;
+                const float fold = -expf(a);
+                if (!(fold < 0.0f) ||
+                    fabsf(fold - b) > 1e-6f * fmaxf(fabsf(fold), 1e-6f))
+                    same = 0;
             }
             for (int64_t j = c.kda_heads; j < c.kda_head_dim; j++) {
                 float a;
                 memcpy(&a, stbuf + 4 * j, 4);
                 if (a != 0.0f) same = 0;
             }
-            ck(same, "A_log: GGUF [kda_heads] == ST prefix, ST tail zero");
+            ck(same, "A_log: GGUF ssm_a == -exp(ST A_log) prefix, ST tail zero");
         } else {
             /* reqw vectors: identical F32 bytes */
             ck(ts->nbytes == tg->nbytes && memcmp(stbuf, raw, (size_t)ts->nbytes) == 0,
@@ -468,23 +476,203 @@ static void run_bit_exact_trunk(const char *st_dir, const char *gg_dir)
     k3_st_close(&st);
 }
 
-/* ------------------------------- C: PARITY GATE 2 (expert self-consistency) */
+/* ------------------------------- C: PARITY GATE 2 (native IQ1_S vs the
+ * raw-dequant reference) - the fix wave's repair of the D2 self-consistency
+ * blind spot.
+ *
+ * The OLD gate compared the engine's requant chain (IQ1_S -> MXFP4 -> matmul)
+ * against a python MIRROR of that requant: self-consistency only, blind to
+ * the 13.3% mean requant error the bake-off caught. The NEW reference is a
+ * RAW IQ1_S dequant to fp32 (independent numpy/torch implementation, NO
+ * requant anywhere in the reference path) and the engine side is the NATIVE
+ * k3_matmul_iq1_s chain. Both sides are fp32, so the expected distance is
+ * accumulation-order class (~1e-6), not the 13% requant class.
+ *
+ * Golden format v2 (tools/ref_gguf_experts.py):
+ *   header: "K3G2" u32 version=2 u32 ncases u32 nmoe u32 E u32 L u32 I
+ *           u32 flags (bit 0 = cases carry edn)
+ *   case :  u32 layer u32 expert u32 rows f32 z[L] f32 gu[rows] f32 up[rows]
+ *           [f32 edn[rows] if flags & 1]
+ *   router: u32 layer f32 x[E] i32 idx[topk] f32 wt[topk]   (nmoe records)
+ * The real-file leg (K3_GGUF_REAL) uses the same v2 format with nmoe = 0 and
+ * no edn: bounded 16-row windows of REAL IQ1_S bytes, z replayed from the
+ * golden. */
+#define G2_BUDGET_REL_L2 1e-4 /* fp32 accumulation class, ~1e-6 measured */
+#define G2_FLAG_HAS_EDN 1u
+
+/* The REAL-file Gate-2 leg: bounded 16-row windows of REAL IQ1_S bytes from
+ * the K3_GGUF_REAL shard dir vs the same raw-dequant numpy reference (golden
+ * generated by tools/ref_gguf_experts.py --gate2-real). The engine reads the
+ * real bytes itself and runs its NATIVE kernel on them - this is rung 1 of
+ * the fix validation ladder. Graceful skip when K3_GGUF_REAL is unset. */
+static void run_gate2_real(const char *gg_dir, const char *golden_path)
+{
+    printf("== parity gate 2 (real bytes): native IQ1_S vs raw-dequant ref ==\n");
+    FILE *f = fopen(golden_path, "rb");
+    if (!f) {
+        ck(0, "open the real gate2 golden %s (generate it with "
+              "ref_gguf_experts.py --gate2-real)",
+           golden_path);
+        return;
+    }
+    unsigned char hdr[32];
+    if (fread(hdr, 1, 32, f) != 32 || memcmp(hdr, "K3G2", 4) != 0) {
+        ck(0, "real gate2 golden header");
+        fclose(f);
+        return;
+    }
+    const uint32_t version = rd32(hdr + 4), ncases = rd32(hdr + 8);
+    const uint32_t nmoe = rd32(hdr + 12);
+    const uint32_t L = rd32(hdr + 20);
+    const uint32_t flags = rd32(hdr + 28);
+    if (version != 2 || nmoe != 0 || (flags & G2_FLAG_HAS_EDN)) {
+        ck(0, "real gate2 golden must be v2, no router records, no edn");
+        fclose(f);
+        return;
+    }
+
+    K3Gguf g;
+    if (k3_gguf_open(&g, gg_dir) != 0) {
+        ck(0, "open the real shard dir %s", gg_dir);
+        fclose(f);
+        return;
+    }
+    /* the golden's dims must match the REAL file's config before any float
+     * is read into the fixed buffers: a corrupt or stale golden must fail
+     * loud, never overflow z[8192] */
+    {
+        K3Cfg rc;
+        static int rfa[64];
+        if (!k3_gguf_cfg(&g, &rc, rfa, 64)) {
+            ck(0, "real gate2 config");
+            k3_gguf_close(&g);
+            fclose(f);
+            return;
+        }
+        const uint32_t E = rd32(hdr + 16), I = rd32(hdr + 24);
+        if ((uint32_t)rc.hidden != E || (uint32_t)rc.latent != L ||
+            (uint32_t)rc.moe_inter != I || L > 8192 || I > 8192) {
+            ck(0, "real gate2 golden dims must match the real file's config "
+                  "(E %u/%d L %u/%d I %u/%d) and fit the test buffers",
+               E, rc.hidden, L, rc.latent, I, rc.moe_inter);
+            k3_gguf_close(&g);
+            fclose(f);
+            return;
+        }
+    }
+
+    static float z[8192], gu[8192], up[8192];
+    double worst_gu = 0.0, worst_up = 0.0;
+    unsigned char rec[8192 * 4 + 64];
+    for (uint32_t ci = 0; ci < ncases; ci++) {
+        const uint32_t rows = 16;
+        const size_t crec = 12 + 4 * (size_t)L + 8 * (size_t)rows;
+        if (fread(rec, 1, crec, f) != crec) {
+            ck(0, "real gate2 golden case %u record", ci);
+            break;
+        }
+        const uint32_t layer = rd32(rec), expert = rd32(rec + 4);
+        const uint32_t gro = rd32(rec + 8);
+        if (gro != rows) {
+            ck(0, "real case L%u e%u: golden rows %u, expected %u", layer,
+               expert, gro, rows);
+            continue;
+        }
+        size_t p = 12;
+        rd_floats(rec + p, (int)L, z);
+        p += 4 * (size_t)L;
+
+        /* The engine reads the real bytes itself: a bounded window of the
+         * expert's contiguous span (rows full-width rows, ~11 KB per matrix). */
+        char gname[96];
+        const char *mats[2] = {"ffn_gate_exps", "ffn_up_exps"};
+        float *out[2] = {gu, up};
+        const float *gold[2] = {(const float *)(rec + p),
+                                (const float *)(rec + p + 4 * (size_t)rows)};
+        double worst[2] = {0.0, 0.0};
+        int ok = 1;
+        for (int m = 0; m < 2; m++) {
+            snprintf(gname, sizeof gname, "blk.%u.%s.weight", layer, mats[m]);
+            const K3Tensor *t = k3_gguf_find(&g, gname);
+            if (!t || t->ndim != 3) {
+                ck(0, "real %s missing", gname);
+                ok = 0;
+                break;
+            }
+            const int64_t per = t->nbytes / t->shape[2];
+            const int64_t rowb =
+                ((t->shape[0] + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK) *
+                K3_GGUF_IQ1_S_BSZ;
+            if ((uint64_t)per < (uint64_t)rows * (uint64_t)rowb) {
+                ck(0, "real %s window overruns the expert span", gname);
+                ok = 0;
+                break;
+            }
+            static unsigned char win[64 << 10];
+            K3Tensor w = *t;
+            w.name     = (char *)"real gate2 window";
+            w.off      = t->off + expert * per;
+            w.nbytes   = (int64_t)rows * rowb;
+            w.ndim     = 2;
+            w.shape[0] = t->shape[0];
+            w.shape[1] = rows;
+            w.shape[2] = w.shape[3] = 1;
+            if (k3_gguf_read(&g, &w, win) != w.nbytes) {
+                ck(0, "real %s window read (L%u e%u)", gname, layer, expert);
+                ok = 0;
+                break;
+            }
+            k3_matmul_iq1_s(out[m], z, win, (int)t->shape[0], (int)rows);
+            const double d = rel_l2(out[m], gold[m], (int)rows);
+            worst[m] = d;
+            if (d > G2_BUDGET_REL_L2) {
+                ck(0, "real case L%u e%u: %s vs raw-dequant ref rel-L2 %.3e "
+                      "> %.0e",
+                   layer, expert, mats[m], d, G2_BUDGET_REL_L2);
+                ok = 0;
+            }
+        }
+        if (ok) {
+            if (worst[0] > worst_gu) worst_gu = worst[0];
+            if (worst[1] > worst_up) worst_up = worst[1];
+            printf("  ok    real L%u e%u: gate rel-L2 %.3e up rel-L2 %.3e\n",
+                   layer, expert, worst[0], worst[1]);
+        }
+    }
+    printf("  real cases %u, engine-vs-raw-dequant worst rel-L2: gu %.3e up "
+           "%.3e (budget %.0e)\n",
+           ncases, worst_gu, worst_up, G2_BUDGET_REL_L2);
+    ck(worst_gu <= G2_BUDGET_REL_L2 && worst_up <= G2_BUDGET_REL_L2,
+       "gate 2 real: native IQ1_S on REAL bytes == raw-dequant reference");
+    k3_gguf_close(&g);
+    fclose(f);
+}
+
 static void run_gate2(const char *gg_dir, const char *golden_path)
 {
-    printf("== parity gate 2: expert requant self-consistency (D2) ==\n");
+    printf("== parity gate 2: native IQ1_S vs the RAW-dequant reference ==\n");
     FILE *f = fopen(golden_path, "rb");
     if (!f) {
         ck(0, "open %s", golden_path);
         return;
     }
-    unsigned char hdr[28];
-    if (fread(hdr, 1, 28, f) != 28 || memcmp(hdr, "K3G2", 4) != 0) {
+    unsigned char hdr[32];
+    if (fread(hdr, 1, 32, f) != 32 || memcmp(hdr, "K3G2", 4) != 0) {
         ck(0, "gate2 golden header");
         fclose(f);
         return;
     }
+    const uint32_t version = rd32(hdr + 4);
     const uint32_t ncases = rd32(hdr + 8), nmoe = rd32(hdr + 12);
     const uint32_t E = rd32(hdr + 16), L = rd32(hdr + 20), I = rd32(hdr + 24);
+    const uint32_t flags = rd32(hdr + 28);
+    if (version != 2) {
+        ck(0, "gate2 golden version %u, expected 2 (v1 carried the requant "
+              "mirror this repair removed)",
+           version);
+        fclose(f);
+        return;
+    }
 
     K3Gguf g;
     if (k3_gguf_open(&g, gg_dir) != 0) {
@@ -526,69 +714,80 @@ static void run_gate2(const char *gg_dir, const char *golden_path)
         return;
     }
 
-    static float z[256], fp32_out[256], req_out[256], gu[512], act[256], edn[256];
-    double worst_tight = 0.0, worst_class = 0.0, worst_noise = 0.0;
-    double best_noise = 1.0, class_sum = 0.0;
-    int nclass = 0;
-    unsigned char rec[4096];
-    const size_t crec = 8 + 4 * (size_t)L * 3 + 4; /* + the noise float */
+    /* real widths (L=3584, I=3072, rows<=I) need larger buffers than the tiny
+     * fixture's; the fixture leg uses rows=I and the real leg rows=16. */
+    static float z[8192], gu[8192], up[8192], act[8192], edn[8192];
+    double worst_gu = 0.0, worst_up = 0.0, worst_edn = 0.0;
+    unsigned char rec[8192 * 4 + 64];
     for (uint32_t ci = 0; ci < ncases; ci++) {
+        const uint32_t rows = (flags & G2_FLAG_HAS_EDN)
+                                  ? I
+                                  : 16; /* real leg: bounded window */
+        const size_t crec = 12 + 4 * (size_t)L + 4 * (size_t)rows *
+                            ((flags & G2_FLAG_HAS_EDN) ? 3 : 2);
         if (fread(rec, 1, crec, f) != crec) {
             ck(0, "gate2 golden case %u record", ci);
             break;
         }
         const uint32_t layer = rd32(rec), expert = rd32(rec + 4);
-        rd_floats(rec + 8, (int)L, z);
-        rd_floats(rec + 8 + 4 * (size_t)L, (int)L, fp32_out);
-        rd_floats(rec + 8 + 8 * (size_t)L, (int)L, req_out);
-        float noise;
-        memcpy(&noise, rec + 8 + 12 * (size_t)L, 4);
+        const uint32_t gro = rd32(rec + 8);
+        if (gro != rows) {
+            ck(0, "case L%u e%u: golden rows %u, expected %u", layer, expert,
+               gro, rows);
+            continue;
+        }
+        size_t p = 12;
+        rd_floats(rec + p, (int)L, z);
+        p += 4 * (size_t)L;
 
         K3ExpertQ q;
         if (es.src.get(&es.src, (int)layer, (int)expert, &q) != 0) {
             ck(0, "expert get L%u e%u", layer, expert);
             continue;
         }
-        k3_matmul_mxfp4(gu, z, q.p1, q.s1, (int)L, (int)I, K3_MXFP4_GROUP);
-        k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, (int)L, (int)I, K3_MXFP4_GROUP);
-        k3_situ_glu(act, gu, (int)I, c.situ_b1, c.situ_b2);
-        k3_matmul_mxfp4(edn, act, q.p2, q.s2, (int)I, (int)L, K3_MXFP4_GROUP);
-
-        const double tight = rel_l2(edn, req_out, (int)L);
-        const double class = rel_l2(edn, fp32_out, (int)L);
-        if (tight > worst_tight) worst_tight = tight;
-        if (class > worst_class) worst_class = class;
-        if (noise > worst_noise) worst_noise = noise;
-        if (noise < best_noise) best_noise = noise;
-        class_sum += class;
-        nclass++;
-        /* D2 self-consistency: the engine sits at the requant mirror within
-         * fp32 accumulation (the golden's mirror uses the same bytes and the
-         * same requant math), and its distance to the fp32 reference is the
-         * golden's OWN measured requant noise class - never a picked
-         * tolerance. */
-        if (tight > 1e-4) {
-            ck(0, "case L%u e%u: engine vs requant-mirror rel-L2 %.3e > 1e-4", layer,
-               expert, tight);
-        }
-        if (noise < 1e-4 || noise > 0.5) {
-            ck(0, "case L%u e%u: golden requant noise %.4f out of class", layer, expert,
-               noise);
-        }
-        if (class > 2.0 * noise + 1e-4) {
-            ck(0,
-               "case L%u e%u: engine vs fp32-ref rel-L2 %.4f > 2x requant "
-               "noise %.4f",
-               layer, expert, class, noise);
+        ck(q.wfmt == K3_EXPERT_IQ1S, "gate 2: expert served as native IQ1_S");
+        k3_matmul_iq1_s(gu, z, q.p1, (int)L, (int)rows);
+        k3_matmul_iq1_s(up, z, q.p3, (int)L, (int)rows);
+        float *gold_gu = (float *)(rec + p);
+        p += 4 * (size_t)rows;
+        float *gold_up = (float *)(rec + p);
+        p += 4 * (size_t)rows;
+        const double dgu = rel_l2(gu, gold_gu, (int)rows);
+        const double dup = rel_l2(up, gold_up, (int)rows);
+        if (dgu > worst_gu) worst_gu = dgu;
+        if (dup > worst_up) worst_up = dup;
+        if (dgu > G2_BUDGET_REL_L2)
+            ck(0, "case L%u e%u: gate matmul vs raw-dequant ref rel-L2 %.3e "
+                  "> %.0e",
+               layer, expert, dgu, G2_BUDGET_REL_L2);
+        if (dup > G2_BUDGET_REL_L2)
+            ck(0, "case L%u e%u: up matmul vs raw-dequant ref rel-L2 %.3e "
+                  "> %.0e",
+               layer, expert, dup, G2_BUDGET_REL_L2);
+        if (flags & G2_FLAG_HAS_EDN) {
+            /* situ_glu needs the [gate|up] concatenation; gu/up hold the two
+             * halves separately for the golden comparison, so stage the
+             * concat in a scratch buffer */
+            static float guu[16384];
+            memcpy(guu, gu, (size_t)rows * sizeof(float));
+            memcpy(guu + rows, up, (size_t)rows * sizeof(float));
+            k3_situ_glu(act, guu, (int)rows, c.situ_b1, c.situ_b2);
+            k3_matmul_iq1_s(edn, act, q.p2, (int)rows, (int)rows);
+            float *gold_edn = (float *)(rec + p);
+            const double de = rel_l2(edn, gold_edn, (int)rows);
+            if (de > worst_edn) worst_edn = de;
+            if (de > G2_BUDGET_REL_L2)
+                ck(0, "case L%u e%u: down chain vs raw-dequant ref rel-L2 %.3e "
+                      "> %.0e",
+                   layer, expert, de, G2_BUDGET_REL_L2);
         }
     }
-    printf("  cases %u, engine-vs-mirror worst %.3e (bound 1e-4)\n", ncases, worst_tight);
-    printf("  requant class: golden min/mean/max %.4f/%.4f/%.4f, engine-vs-"
-           "fp32ref worst %.4f\n",
-           best_noise, class_sum / (nclass ? nclass : 1), worst_noise, worst_class);
-    ck(worst_tight <= 1e-4, "gate 2: engine == requant mirror (fp32 class)");
-    ck(worst_class <= 2.0 * worst_noise + 1e-4,
-       "gate 2: engine within the golden's own requant noise class");
+    printf("  cases %u, engine-vs-raw-dequant worst rel-L2: gu %.3e up %.3e "
+           "edn %.3e (budget %.0e)\n",
+           ncases, worst_gu, worst_up, worst_edn, G2_BUDGET_REL_L2);
+    ck(worst_gu <= G2_BUDGET_REL_L2 && worst_up <= G2_BUDGET_REL_L2 &&
+           (!(flags & G2_FLAG_HAS_EDN) || worst_edn <= G2_BUDGET_REL_L2),
+       "gate 2: native IQ1_S chain == independent raw-dequant fp32 reference");
 
     /* router agreement: the golden captured the reference's selections on the
      * SAME gate bytes; the engine's k3_router must select identically */
@@ -1045,7 +1244,10 @@ static int bf16eq_find(void *ctx, const char *name, int64_t *off, int64_t *nbyte
     int dt;
     if (is_alog) {
         /* engine plan: want kda_head_dim, take kda_heads; the file ships
-         * kda_heads; pad the tail exactly like the map's MF_PAD_D */
+         * kda_heads in the FOLDED form ssm_a = -exp(A_log); the finder
+         * UNFOLDS per element (A_log = ln(-ssm_a)) exactly as the map's gfind
+         * does, and pads the tail like the map's MF_PAD_D. A non-negative
+         * value fails the bind (corrupt file). */
         out_numel = b->c->kda_head_dim;
         out_bytes = out_numel * 4;
         dt        = K3_DT_F32;
@@ -1073,6 +1275,13 @@ static int bf16eq_find(void *ctx, const char *name, int64_t *off, int64_t *nbyte
     if (k3_gguf_dequant(&gt, reqw ? K3_GGUF_DEQ_F32 : K3_GGUF_DEQ_BF16, dst, &ex) != 0)
         return -1;
     if (is_alog) {
+        if (t->shape[0] > b->c->kda_head_dim) return -1; /* would overflow */
+        float *a = (float *)dst;
+        for (int64_t i = 0; i < t->shape[0]; i++) {
+            const float s = a[i];
+            if (!(s < 0.0f)) return -1; /* non-negative ssm_a: corrupt file */
+            a[i] = logf(-s);
+        }
         memset(dst + 4 * (size_t)t->shape[0], 0,
                4 * (size_t)(b->c->kda_head_dim - t->shape[0]));
     }
@@ -1230,6 +1439,25 @@ int main(int argc, char **argv)
     run_bit_exact_trunk(st_dir, bt_dir);
 
     run_gate2(gg_dir, g2_path);
+
+    /* the real-file leg (rung 1): K3_GGUF_REAL points at the UD-IQ1_S shard
+     * dir; the golden comes from K3_GGUF_REAL_G2 (default /tmp). Both unset ->
+     * graceful skip. */
+    {
+        const char *real = getenv("K3_GGUF_REAL");
+        if (real && *real) {
+            const char *g2 = getenv("K3_GGUF_REAL_G2");
+            char g2b[1024];
+            if (!g2 || !*g2) {
+                snprintf(g2b, sizeof g2b, "/tmp/gguf_gate2_real_golden.bin");
+                g2 = g2b;
+            }
+            run_gate2_real(real, g2);
+        } else {
+            printf("== parity gate 2 (real bytes): SKIPPED (set K3_GGUF_REAL "
+                   "to the UD-IQ1_S shard dir) ==\n");
+        }
+    }
 
     /* ---- full-model gates ---- */
     K3Gguf g;

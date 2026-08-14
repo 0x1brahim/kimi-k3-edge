@@ -119,6 +119,7 @@ int main(int argc, char **argv)
     for (int pass = 0; pass < 3; pass++)
         for (int e = 0; e < NE; e++) {
             K3ExpertQ q;
+            memset(&q, 0, sizeof q); /* zero wfmt: the ST cache never writes the tag */
             if (cache.src.get(&cache.src, 0, e, &q) != 0) { bad++; continue; }
             if (!same_expert(&st, 0, e, &q)) bad++;
         }
@@ -140,6 +141,7 @@ int main(int argc, char **argv)
             batches++;
             for (int j = 0; j < c.topk; j++) {
                 K3ExpertQ q;
+                memset(&q, 0, sizeof q); /* zero wfmt, see above */
                 if (cache.src.get(&cache.src, 0, ids[j], &q) != 0) { bad2++; continue; }
                 if (!same_expert(&st, 0, ids[j], &q)) bad2++;
             }
@@ -173,6 +175,7 @@ int main(int argc, char **argv)
             cache.src.getmany(&cache.src, 0, ids, 4);
         }
         K3ExpertQ q;
+        memset(&q, 0, sizeof q); /* zero wfmt, see above */
         if (cache.src.get(&cache.src, 0, e, &q) != 0) { bad3++; continue; }
         if (!same_expert(&st, 0, e, &q)) bad3++;
     }

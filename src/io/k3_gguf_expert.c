@@ -10,7 +10,6 @@
 #include "k3_gguf_expert.h"
 #include "k3_gguf_dequant.h"
 #include "k3_gguf_map.h"
-#include "k3_mxfp4_quant.h"
 #include "k3_st.h"
 
 #define K3_GGUF_SLOT_EMPTY (-1)
@@ -109,22 +108,23 @@ static int resolve_geometry(K3GgufExpertSrc *s)
     }
     for (int m = 0; m < 3; m++) {
         /* Per-expert IQ1_S window: ne2 is the slowest dim, so expert e owns the
-         * contiguous span [e*per, (e+1)*per). The 2-D sub-tensor dequant below
-         * re-validates the formula on every admit. */
-        s->p_bytes[m] = (int64_t)s->rows[m] * (s->cols[m] / 2);
-        s->s_bytes[m] = (int64_t)s->rows[m] * (s->cols[m] / K3_MXFP4_GROUP);
-        if (s->cols[m] % K3_MXFP4_GROUP != 0 || s->cols[m] % 2 != 0)
-            return xfail("expert width %d is not MXFP4-compatible (group 32)",
-                         s->cols[m]);
+         * contiguous span [e*per, (e+1)*per). The window is rows of
+         * ceil(cols/256)*50 bytes (rows padded to the 256-block exactly as the
+         * on-disk bytes are); k3_matmul_iq1_s consumes it as-is and skips the
+         * padding. The 2-D sub-tensor read below re-validates the formula on
+         * every admit. */
+        const int64_t per = (int64_t)s->rows[m] *
+                            ((s->cols[m] + K3_GGUF_IQ1_S_QK - 1) /
+                             K3_GGUF_IQ1_S_QK) *
+                            K3_GGUF_IQ1_S_BSZ;
+        s->i_bytes[m] = per;
     }
-    /* Canonical run order inside a slot: w1.p w1.s w2.p w2.s w3.p w3.s
-     * (k3_load.h's measured layout; K3ExpertQ maps p1/s1=w1, p2/s2=w2, p3/s3=w3). */
+    /* Canonical run order inside a slot: w1 then w2 then w3 (k3_load.h's
+     * measured layout; K3ExpertQ maps p1=w1, p2=w2, p3=w3). */
     int64_t o = 0;
     for (int m = 0; m < 3; m++) {
-        s->p_off[m] = o;
-        o += s->p_bytes[m];
-        s->s_off[m] = o;
-        o += s->s_bytes[m];
+        s->i_off[m] = o;
+        o += s->i_bytes[m];
     }
     s->slot_bytes = o;
     return 0;
@@ -135,12 +135,13 @@ static int resolve_geometry(K3GgufExpertSrc *s)
 static void fill_q(const K3GgufExpertSrc *s, int slot, K3ExpertQ *q)
 {
     const unsigned char *b = s->arena + (size_t)slot * s->slot_bytes;
-    q->p1                  = b + s->p_off[0];
-    q->s1                  = b + s->s_off[0];
-    q->p2                  = b + s->p_off[1];
-    q->s2                  = b + s->s_off[1];
-    q->p3                  = b + s->p_off[2];
-    q->s3                  = b + s->s_off[2];
+    /* Native IQ1_S storage: the raw block bytes, tagged so k3_moe dispatches
+     * to k3_matmul_iq1_s. The scale pointers are unused in this encoding. */
+    q->wfmt = K3_EXPERT_IQ1S;
+    q->p1   = b + s->i_off[0];
+    q->p2   = b + s->i_off[1];
+    q->p3   = b + s->i_off[2];
+    q->s1 = q->s2 = q->s3 = NULL;
 }
 
 static int pick_victim(K3GgufExpertSrc *s)
@@ -158,10 +159,12 @@ static int pick_victim(K3GgufExpertSrc *s)
     return best;
 }
 
-/* The whole admit: dequant one expert's three IQ1_S windows to fp32 and requant
- * to MXFP4 into the reserved slot. The layer's OWN tensors are resolved per
- * admit (the geometry is validated for every layer at init; a dense layer has
- * no expert tensors and fails here, loudly). Returns 0 on success. */
+/* The whole admit: read one expert's three IQ1_S windows straight into the
+ * reserved slot - no dequant, no requant, no transient (the fix wave's native
+ * storage; the old D2a admit dequantized and re-quantized to MXFP4 here). The
+ * layer's OWN tensors are resolved per admit (the geometry is validated for
+ * every layer at init; a dense layer has no expert tensors and fails here,
+ * loudly). Returns 0 on success. */
 static int fill_slot(K3GgufExpertSrc *s, int layer, int expert, int slot)
 {
     if (k3_is_dense(s->c, layer))
@@ -183,13 +186,11 @@ static int fill_slot(K3GgufExpertSrc *s, int layer, int expert, int slot)
          * nbytes against the block formula on every admit (fail loud on a
          * corrupt shard, never a silent garbage expert). */
         const int64_t pe = t[m]->nbytes / t[m]->shape[2];
-        if ((size_t)pe > s->raw_cap) {
-            size_t nc         = (size_t)pe;
-            unsigned char *np = (unsigned char *)realloc(s->raw, nc);
-            if (!np) return xfail("out of memory for the %zu-byte expert window", nc);
-            s->raw     = np;
-            s->raw_cap = nc;
-        }
+        if (pe != s->i_bytes[m])
+            return xfail("L%d expert %d: %s window is %lld bytes, geometry says "
+                         "%lld",
+                         layer, expert, t[m]->name, (long long)pe,
+                         (long long)s->i_bytes[m]);
         K3Tensor win = *t[m];
         win.name     = (char *)"expert window";
         win.off      = t[m]->off + expert * pe;
@@ -198,56 +199,13 @@ static int fill_slot(K3GgufExpertSrc *s, int layer, int expert, int slot)
         win.shape[0] = s->cols[m];
         win.shape[1] = s->rows[m];
         win.shape[2] = win.shape[3] = 1;
-        const int64_t got           = k3_st_read(&sv, &win, s->raw);
+        unsigned char *dst =
+            s->arena + (size_t)slot * s->slot_bytes + s->i_off[m];
+        const int64_t got = k3_st_read(&sv, &win, dst);
         if (got != pe)
             return xfail("short read of the %s window of L%d expert %d (%lld of "
                          "%lld bytes)",
                          t[m]->name, layer, expert, (long long)got, (long long)pe);
-
-        const int64_t ne[4] = {s->cols[m], s->rows[m], 1, 1};
-        K3GgufTensor gt;
-        memset(&gt, 0, sizeof gt);
-        gt.ggml_type = K3_GGUF_TYPE_IQ1_S;
-        gt.ndim      = 2;
-        memcpy(gt.ne, ne, sizeof ne);
-        gt.nbytes = pe;
-        gt.data   = s->raw;
-        K3GgufExpect ex;
-        memset(&ex, 0, sizeof ex);
-        ex.ndim = 2;
-        memcpy(ex.ne, ne, sizeof ne);
-        /* The dequant PADS every row to the 256-block: ceil(cols/256)*256 values
-         * per row, not cols. Dequant into the padded scratch, then compact each
-         * row so the requant sees a contiguous [rows][cols] matrix. (The real
-         * file's widths are exact block multiples, where the two coincide; the
-         * compact step is what keeps non-multiple widths correct instead of
-         * silently reading the padding as weights.) */
-        const int64_t prow  = (s->cols[m] / K3_GGUF_IQ1_S_QK + 1) * K3_GGUF_IQ1_S_QK;
-        const size_t padded = (size_t)prow * s->rows[m];
-        if (padded * sizeof(float) > s->f32_cap) {
-            size_t nc = padded * sizeof(float);
-            float *np = (float *)realloc(s->f32, nc);
-            if (!np)
-                return xfail("out of memory for the %zu-float padded scratch",
-                             (size_t)padded);
-            s->f32     = np;
-            s->f32_cap = nc;
-        }
-        if (k3_gguf_dequant(&gt, K3_GGUF_DEQ_F32, s->f32, &ex) != 0) return -1;
-        if (prow != s->cols[m]) {
-            /* Every move is DOWNWARD (dest = r*cols < src = r*prow), so the
-             * copies must run ASCENDING: r=4's destination lands exactly on
-             * r=1's source (4*cols == prow), and a descending loop would
-             * destroy it before it is read. */
-            const size_t rowb = (size_t)s->cols[m] * sizeof(float);
-            for (int r = 0; r < s->rows[m]; r++)
-                memmove((unsigned char *)s->f32 + (size_t)r * rowb,
-                        (unsigned char *)s->f32 + (size_t)r * prow * sizeof(float), rowb);
-        }
-
-        unsigned char *pk = s->arena + (size_t)slot * s->slot_bytes + s->p_off[m];
-        unsigned char *sc = s->arena + (size_t)slot * s->slot_bytes + s->s_off[m];
-        if (k3_mxfp4_quant(pk, sc, s->f32, s->rows[m], s->cols[m]) != 0) return -1;
     }
     s->bytes_read +=
         (uint64_t)(t[0]->nbytes / t[0]->shape[2] + t[1]->nbytes / t[1]->shape[2] +
@@ -356,10 +314,10 @@ static int gsrc_getmany(K3ExpertSrc *self, int layer, const int *experts, int n)
         w[nw].expert     = e;
         nw++;
     }
-    /* Phase 2+3 (serial fills, publish after each): the dequant+requant is
-     * CPU-bound and the reads are page-cache hits, so parallel fills would only
-     * multiply the fp32 transient; the INFLIGHT discipline above is still the
-     * real state machine. */
+    /* Phase 2+3 (serial fills, publish after each): the reads are page-cache
+     * hits and the fills are plain preads into the slots, so parallel fills
+     * would only add thread bookkeeping; the INFLIGHT discipline above is
+     * still the real state machine. */
     int ok = 0;
     for (int i = 0; i < nw; i++) {
         const int32_t key = layer * s->c->n_experts + w[i].expert;
@@ -443,20 +401,6 @@ int k3_gguf_expert_src_init(K3GgufExpertSrc *s, const K3Gguf *g, const K3Cfg *c,
     }
     for (size_t i = 0; i < nkey; i++) s->slot_of[i] = -1;
     for (int i = 0; i < s->nslot; i++) s->key_of[i] = K3_GGUF_SLOT_EMPTY;
-
-    /* The fp32 transient: the largest per-expert matrix (rows*cols floats). */
-    {
-        int64_t maxv = 0;
-        for (int m = 0; m < 3; m++)
-            if ((int64_t)s->rows[m] * s->cols[m] > maxv)
-                maxv = (int64_t)s->rows[m] * s->cols[m];
-        s->f32_cap = (size_t)maxv * sizeof(float);
-        s->f32     = (float *)malloc(s->f32_cap);
-        if (!s->f32) {
-            k3_gguf_expert_src_free(s);
-            return -1;
-        }
-    }
     return 0;
 }
 
@@ -466,8 +410,6 @@ void k3_gguf_expert_src_free(K3GgufExpertSrc *s)
     free(s->slot_of);
     free(s->key_of);
     free(s->used_at);
-    free(s->raw);
-    free(s->f32);
     memset(s, 0, sizeof *s);
 }
 

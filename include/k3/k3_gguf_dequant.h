@@ -45,7 +45,7 @@
 #define K3_GGUF_Q8_0_QK   32    /* values per block  */
 #define K3_GGUF_Q8_0_BSZ  34    /* bytes per block: ggml_half d + int8 qs[32] */
 #define K3_GGUF_IQ1_S_QK  256   /* values per block  */
-#define K3_GGUF_IQ1_S_BSZ 50    /* bytes per block: ggml_half d + qs[32] + qh[16] */
+#define K3_GGUF_IQ1_S_BSZ 50    /* bytes per block: ggml_half d + qs[32] + qh[8] u16 */
 
 /* Dequant output element type. The engine's canonical narrow dtype is bf16; fp32 is
  * the widened form. bf16 conversion is round-to-nearest-even (see k3_gguf_f32_to_bf16). */

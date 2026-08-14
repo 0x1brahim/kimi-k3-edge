@@ -1,5 +1,5 @@
 /* test_gguf_bind.c - the GGUF io-integration unit (D4a name map + shape
- * contracts, D3a streamed layer bind, D2a expert requant + source).
+ * contracts, D3a streamed layer bind, native IQ1_S expert source).
  *
  * Four parts:
  *   (a) name-map round trips and shape-contract positives/adversarial cases,
@@ -20,6 +20,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,6 +187,13 @@ typedef struct {
     unsigned char *data;
     size_t nbytes;
 } Reg;
+
+/* A_log FOLD test vector (architect fix wave): the checkpoint ships
+ * ssm_a = -exp(A_log) (unsloth converter fold); these are the KNOWN A_log
+ * values whose fold the bind must recover (A_log = ln(-ssm_a), k3_gguf_map.c).
+ * The synthetic fixture's ssm_a tensors carry -exp(ALOG_TRUE) so the bind's
+ * unfold is checkable against real numbers, not self-consistency. */
+static const float ALOG_TRUE[2] = {-0.5f, 0.25f};
 
 static void reg_tensor(Buf *infos, Reg *r, const char *name, uint32_t ndim,
                        const uint64_t *dims, uint32_t gtype)
@@ -388,6 +396,14 @@ static void build_model(Shard *s1, Shard *s2, int variant)
             reg_tensor(&infos, &regs[n++], nm, 2, HN, 8);
             snprintf(nm, sizeof nm, "blk.%d.ssm_a", L);
             reg_tensor(&infos, &regs[n++], nm, 1, HH2, 0);
+            /* The real checkpoint ships ssm_a FOLDED as -exp(A_log); write the
+             * fold of the known ALOG_TRUE values so the bind's unfold can be
+             * asserted against real numbers. */
+            {
+                float ssm[2];
+                for (int i = 0; i < 2; i++) ssm[i] = -expf(ALOG_TRUE[i]);
+                memcpy(regs[n - 1].data, ssm, sizeof ssm);
+            }
             snprintf(nm, sizeof nm, "blk.%d.ssm_beta.weight", L);
             reg_tensor(&infos, &regs[n++], nm, 2, HHH, 0);
             snprintf(nm, sizeof nm, "blk.%d.ssm_conv1d_q.weight", L);
@@ -1006,21 +1022,116 @@ static void run_synthetic_fixture(void)
         free(expect);
     }
 
-    /* A_log: 2 real values, then zero padding to kda_head_dim(32) */
+    /* A_log: the file stores the FOLDED ssm_a = -exp(A_log); the bind must
+     * recover the KNOWN A_log values (ln(-ssm_a)), with the tail padded to
+     * kda_head_dim(32) with zeros. This is the A_log unfold correctness
+     * check of the fix wave (architect (c)); the fold itself is also asserted
+     * to be negative, as the real file's 96 values are. */
     {
         const K3Tensor *t = k3_gguf_find(&g, "blk.0.ssm_a");
         float *expect     = (float *)malloc((size_t)t->nbytes);
         if (k3_gguf_read(&g, t, expect) == t->nbytes) {
-            int head_ok = L0.kda.A_log && !memcmp(L0.kda.A_log, expect, 8);
+            int head_ok = L0.kda.A_log != NULL;
+            for (int i = 0; head_ok && i < 2; i++) {
+                const float got  = L0.kda.A_log[i];
+                const float want = ALOG_TRUE[i];
+                /* logf/expf round-trip is not guaranteed bit-exact; 1e-6
+                 * relative is 10+ ulps of headroom on the fp32 unfold. */
+                if (fabsf(got - want) > 1e-6f * fmaxf(fabsf(want), 1e-6f))
+                    head_ok = 0;
+            }
             int tail_ok = L0.kda.A_log != NULL;
             for (int i = 2; tail_ok && i < 32; i++)
                 if (L0.kda.A_log[i] != 0.0f) tail_ok = 0;
-            ck(head_ok && tail_ok, "A_log: kda_heads real values + zero tail");
+            int fold_ok = 1;
+            for (int i = 0; i < 2; i++)
+                if (!(expect[i] < 0.0f)) fold_ok = 0;
+            ck(head_ok && tail_ok && fold_ok,
+               "A_log: bind recovers ln(-ssm_a) of the known values + zero "
+               "tail");
         } else {
             printf("  FAIL  cannot read blk.0.ssm_a\n");
             fails++;
         }
         free(expect);
+    }
+
+    /* A_log unfold unit: boundary and fail-loud, against the REAL file read
+     * path. Patch the fixture's blk.0.ssm_a bytes on disk and re-bind: the
+     * boundary ssm_a = -1.0 must unfold to exactly 0.0 (ln(1)), and a
+     * non-negative ssm_a must fail the bind loud. The original bytes are
+     * restored afterwards so the later reuse checks see a pristine fixture.
+     * Every patch is fflush()ed before the bind: the re-bind reads through
+     * the engine's own pread path, which must see the new bytes. */
+    {
+        const K3Tensor *t = k3_gguf_find(&g, "blk.0.ssm_a");
+        float orig[2];
+        if (!t || k3_gguf_read(&g, t, orig) != t->nbytes) {
+            ck(0, "A_log unfold unit: read the original ssm_a");
+        } else {
+            char p[512];
+            snprintf(p, sizeof p, "%s/s2.gguf", g_dir);
+            FILE *f = fopen(p, "r+b");
+            if (!f) {
+                ck(0, "A_log unfold unit: open the fixture for patching");
+            } else {
+                /* boundary: -1.0 -> A_log = 0.0 exactly */
+                const float minus_one = -1.0f;
+                fseek(f, (long)t->off, SEEK_SET);
+                int wrote = fwrite(&minus_one, 4, 1, f) == 1;
+                if (wrote) wrote = fflush(f) == 0;
+                if (!wrote) {
+                    ck(0, "A_log boundary: patch ssm_a[0] = -1.0");
+                } else {
+                    K3LayerBind Lb;
+                    if (k3_gguf_bind_layer(&b, 0, &Lb) != 0 || !Lb.lay.kda ||
+                        !Lb.kda.A_log) {
+                        ck(0, "A_log boundary: re-bind layer 0");
+                    } else {
+                        ck(Lb.kda.A_log[0] == 0.0f &&
+                               fabsf(Lb.kda.A_log[1] - ALOG_TRUE[1]) <
+                                   1e-6f * fmaxf(fabsf(ALOG_TRUE[1]), 1e-6f),
+                           "A_log boundary: ssm_a = -1.0 unfolds to exactly "
+                           "0.0");
+                    }
+                    k3_bind_free(&Lb);
+                }
+                /* fail-loud: a NON-NEGATIVE ssm_a (corrupt/retrained file)
+                 * must be rejected, not silently passed or NaN'd */
+                const float plus_one = 1.0f;
+                fseek(f, (long)t->off, SEEK_SET);
+                wrote = fwrite(&plus_one, 4, 1, f) == 1;
+                if (wrote) wrote = fflush(f) == 0;
+                if (!wrote) {
+                    ck(0, "A_log fail-loud: patch ssm_a[0] = +1.0");
+                } else {
+                    K3LayerBind Lb;
+                    const int rc = k3_gguf_bind_layer(&b, 0, &Lb);
+                    ck(rc != 0, "A_log fail-loud: non-negative ssm_a fails "
+                                "the bind");
+                    k3_bind_free(&Lb);
+                }
+                /* zero is equally corrupt: A_log would be ln(0) = -inf */
+                const float zero = 0.0f;
+                fseek(f, (long)t->off, SEEK_SET);
+                wrote = fwrite(&zero, 4, 1, f) == 1;
+                if (wrote) wrote = fflush(f) == 0;
+                if (!wrote) {
+                    ck(0, "A_log fail-loud: patch ssm_a[0] = 0.0");
+                } else {
+                    K3LayerBind Lb;
+                    const int rc = k3_gguf_bind_layer(&b, 0, &Lb);
+                    ck(rc != 0, "A_log fail-loud: zero ssm_a fails the bind");
+                    k3_bind_free(&Lb);
+                }
+                /* restore: the reuse checks later re-bind layer 0 and must
+                 * see the pristine fixture */
+                fseek(f, (long)t->off, SEEK_SET);
+                fwrite(orig, 4, 2, f);
+                fflush(f);
+                fclose(f);
+            }
+        }
     }
 
     /* b_proj: F32 on disk, bf16 in the engine */
@@ -1243,73 +1354,54 @@ static void run_synthetic_fixture(void)
     k3_bind_model_free(&mb);
 
     /* ---- expert source ---- */
+    /* Native IQ1_S storage (fix wave): the slot holds the RAW block bytes of
+     * the three windows, 50 B per 256-value block row-padded (64-wide rows
+     * pad to one 256 block each): 3 * 64 * 50 = 9600 B per slot. */
+    const int64_t slot_b = 3 * 64 * K3_GGUF_IQ1_S_BSZ;
     K3GgufExpertSrc es;
-    ck(k3_gguf_expert_src_init(&es, &g, &c, (int64_t)2 * 3 * (64 * 32 + 64 * 2)) == 0,
+    ck(k3_gguf_expert_src_init(&es, &g, &c, 2 * slot_b) == 0,
        "expert source init with 2 slots");
-    ck(es.nslot == 2 && es.slot_bytes == 3 * (64 * 32 + 64 * 2),
-       "expert source geometry: 2 slots of the canonical run size");
+    ck(es.nslot == 2 && es.slot_bytes == slot_b,
+       "expert source geometry: 2 slots of the canonical IQ1_S run size");
     /* a budget below topk+1 slots must fail loud */
     K3GgufExpertSrc es2;
-    ck(k3_gguf_expert_src_init(&es2, &g, &c, (int64_t)1 * 3 * (64 * 32 + 64 * 2) - 1) !=
-           0,
+    ck(k3_gguf_expert_src_init(&es2, &g, &c, 1 * slot_b - 1) != 0,
        "expert source refuses a budget below topk+1 slots");
     k3_gguf_expert_src_free(&es2);
 
     K3ExpertQ q;
     ck(es.src.get(&es.src, 2, 0, &q) == 0, "expert source get(2,0)");
-    ck(q.p1 && q.s1 && q.p2 && q.s2 && q.p3 && q.s3, "expert source fills all 6");
+    ck(q.wfmt == K3_EXPERT_IQ1S && q.p1 && q.p2 && q.p3 && !q.s1 && !q.s2 &&
+           !q.s3,
+       "expert served as native IQ1_S (wfmt tag, no scale pointers)");
     ck(es.misses == 1 && es.hits == 0, "first get is a miss");
 
-    /* slot content = requant(dequant(window)) computed independently */
+    /* slot content == the raw IQ1_S window bytes read independently (no
+     * requant, no transform - the fix wave's storage contract) */
     {
         char gate[64], up[64], down[64];
         k3_gguf_expert_names(2, gate, up, down);
-        const K3Tensor *gt = k3_gguf_find(&g, gate);
-        const int64_t per  = gt->nbytes / 2;
-        unsigned char *raw = (unsigned char *)malloc((size_t)per);
-        /* The dequant PADS rows to the 256-block: 256*64 floats, compacted to
-         * 64*64 before the requant, exactly like the source does. */
-        float *f32        = (float *)malloc(256 * 64 * 4);
-        float *cmp        = (float *)malloc(64 * 64 * 4);
-        unsigned char *pk = (unsigned char *)malloc(64 * 32);
-        unsigned char *sc = (unsigned char *)malloc(64 * 2);
-        int ok            = 1;
-        /* expert 0's window is the FIRST per bytes of the merged tensor */
-        K3Tensor win = *gt;
-        win.name     = (char *)"expert window";
-        win.off      = gt->off;
-        win.nbytes   = per;
-        if (k3_gguf_read(&g, &win, raw) != per) ok = 0;
-        K3GgufTensor t2;
-        K3GgufExpect ex2;
-        memset(&t2, 0, sizeof t2);
-        t2.ggml_type = K3_GGUF_TYPE_IQ1_S;
-        t2.ndim      = 2;
-        t2.ne[0]     = 64;
-        t2.ne[1]     = 64;
-        t2.nbytes    = per;
-        t2.data      = raw;
-        memset(&ex2, 0, sizeof ex2);
-        ex2.ndim  = 2;
-        ex2.ne[0] = 64;
-        ex2.ne[1] = 64;
-        if (k3_gguf_dequant(&t2, K3_GGUF_DEQ_F32, f32, &ex2) != 0) ok = 0;
-        for (int r = 0; r < 64; r++)
-            memcpy(cmp + (size_t)r * 64, f32 + (size_t)r * 256, 64 * 4);
-
-        if (k3_mxfp4_quant(pk, sc, cmp, 64, 64) != 0) ok = 0;
-        if (ok) {
-            ck(!memcmp(q.p1, pk, 64 * 32) && !memcmp(q.s1, sc, 64 * 2),
-               "slot p1/s1 == requant of the independent window dequant");
-        } else {
-            printf("  FAIL  cannot recompute the expert slot\n");
+        const char *name[3] = {gate, down, up}; /* w1, w2, w3 */
+        int ok              = 1;
+        for (int m = 0; m < 3; m++) {
+            const K3Tensor *gt = k3_gguf_find(&g, name[m]);
+            const int64_t per  = gt->nbytes / 2;
+            unsigned char *raw = (unsigned char *)malloc((size_t)per);
+            K3Tensor win       = *gt;
+            win.name           = (char *)"expert window";
+            win.off            = gt->off; /* expert 0: the first window */
+            win.nbytes         = per;
+            if (k3_gguf_read(&g, &win, raw) != per) ok = 0;
+            const unsigned char *p = m == 0 ? q.p1 : (m == 1 ? q.p2 : q.p3);
+            if (memcmp(p, raw, (size_t)per) != 0) ok = 0;
+            free(raw);
+        }
+        if (ok)
+            ck(1, "slot bytes == the raw IQ1_S windows from disk");
+        else {
+            printf("  FAIL  slot bytes differ from the raw windows\n");
             fails++;
         }
-        free(raw);
-        free(f32);
-        free(cmp);
-        free(pk);
-        free(sc);
     }
 
     ck(es.src.get(&es.src, 2, 0, &q) == 0 && es.hits == 1, "second get is a hit");

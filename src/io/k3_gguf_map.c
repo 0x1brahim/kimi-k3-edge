@@ -18,8 +18,11 @@
  *     engine res entries resolve: *_res_norm -> the folded vector, *_res_proj ->
  *     a constant-1.0 vector (the engine folds norm*proj itself, and
  *     score*1.0 == score).
- *   - ssm_a is kda_heads values (96); the engine's plan wants kda_head_dim and
- *     takes a kda_heads prefix, so the finder zero-pads the tail.
+ *   - ssm_a is kda_heads values (96) carrying the FOLDED form -exp(A_log)
+ *     (the unsloth converter folds at conversion time, kimi_k3.py:333-336);
+ *     the engine's plan wants kda_head_dim and takes a kda_heads prefix, so
+ *     the finder UNFOLDS per element (A_log = ln(-ssm_a), fail-loud on any
+ *     non-negative value) and zero-pads the tail.
  *   - ssm_beta (b_proj) ships F32; the engine keeps it narrow (bf16), so the
  *     finder converts F32 -> bf16 at dequant time.
  *   - ssm_conv1d_{q,k,v}.weight are ne=[conv_k, 1, P] F32: the engine's
@@ -33,6 +36,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <math.h>
 
 #include "k3_gguf_map.h"
 #include "k3_gguf_dequant.h"
@@ -964,6 +968,32 @@ static int gfind(void *ctx, const char *name, int64_t *off, int64_t *nbytes, int
     unsigned char *dst = b->buf + dst_off;
 
     if (dequant_chunked(b, t, e, ne, dst) != 0) return -1;
+    if (e->flags & MF_PAD_D) {
+        /* A_log FOLD UNFOLD (architect fix wave, correctness): the checkpoint
+         * ships ssm_a = -exp(A_log), so a value that is NOT negative is a
+         * corrupt or retrained file and must fail loud, never pass silently
+         * (a non-negative ssm_a would make logf() NaN and poison every KDA
+         * layer of the run). The real file's 96 values are all in
+         * [-11.78, -0.47] (diag-dev measurement); the engine's KDA exp()s
+         * A_log at runtime (k3_kda_decay), so the bind stores the UNFOLDED
+         * value A_log = ln(-ssm_a). */
+        if (e->out != K3_GGUF_DEQ_F32)
+            return mfail("%s: A_log must be bound as fp32 for the unfold",
+                         t->name);
+        if (ne[0] > b->c->kda_head_dim)
+            return mfail("%s: %lld ssm_a values exceed the engine's kda_head_dim "
+                         "%d; the unfold would overflow the A_log region",
+                         t->name, (long long)ne[0], b->c->kda_head_dim);
+        float *a = (float *)dst;
+        for (int64_t i = 0; i < ne[0]; i++) {
+            const float s = a[i];
+            if (!(s < 0.0f))
+                return mfail("%s: ssm_a[%lld] = %g is not negative; the file "
+                             "must store ssm_a = -exp(A_log)",
+                             t->name, (long long)i, s);
+            a[i] = logf(-s);
+        }
+    }
     if (e->flags & MF_PAD_D && b->c->kda_head_dim > ne[0])
         memset(dst + (size_t)ne[0] * esz, 0, (size_t)(b->c->kda_head_dim - ne[0]) * esz);
 

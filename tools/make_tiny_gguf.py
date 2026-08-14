@@ -410,8 +410,15 @@ def build_tensors(cfg, model, grid, trunk_mode):
                 bproj = _bf16eq(bproj)
             add("blk.%d.ssm_beta.weight" % layer_idx, (H, cfg.kda_num_heads), 0,
                 bproj.tobytes())
+            # The REAL checkpoint ships ssm_a FOLDED as -exp(A_log) (unsloth's
+            # converter, conversion/kimi_k3.py:333-336: ssm_a = -exp(A_log));
+            # llama.cpp consumes the fold directly. The engine's KDA exp()s
+            # A_log at runtime (k3_kda_decay), so the map UNFOLDS at bind
+            # (A_log = ln(-ssm_a), k3_gguf_map.c). The fixture must carry the
+            # same folded bytes as the real file or the unfold is untestable.
+            alog = f32_of(lp("self_attn.A_log"))
             add("blk.%d.ssm_a" % layer_idx, (cfg.kda_num_heads,), 0,
-                f32_of(lp("self_attn.A_log")).tobytes())
+                (-np.exp(alog)).astype(np.float32).tobytes())
             add("blk.%d.ssm_dt.bias" % layer_idx, (P,), 0,
                 f32_of(lp("self_attn.dt_bias")).tobytes())
             add("blk.%d.ssm_norm.weight" % layer_idx, (D,), 0,

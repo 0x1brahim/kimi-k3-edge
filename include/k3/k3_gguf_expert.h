@@ -1,28 +1,37 @@
-/* k3_gguf_expert.h - K3ExpertSrc over the GGUF merged expert tensors (D2a).
+/* k3_gguf_expert.h - K3ExpertSrc over the GGUF merged expert tensors (fix wave:
+ * native IQ1_S storage, replacing the D2a IQ1_S->MXFP4 requant admit).
  *
  * The GGUF checkpoint stores the 896 routed experts of each MoE layer as THREE
  * merged 3-D IQ1_S tensors (blk.N.ffn_{gate,up,down}_exps.weight, ne =
  * [latent, moe_inter, experts] for gate/up, [moe_inter, latent, experts] for
  * down; expert e owns the contiguous byte window [e*per, (e+1)*per)). The
- * engine's kernels consume experts as packed MXFP4 + E8M0 scales (K3ExpertQ,
- * k3.h), so this source dequantizes IQ1_S -> fp32 and RE-QUANTIZES fp32 ->
- * MXFP4 (k3_mxfp4_quant) at cache-admit time, exactly the architect's D2a
- * verdict: the K3ExpertSrc/K3ExpertQ/kernels stay 100% untouched, and the slot
- * holds the engine's canonical run order (w1.p w1.s w2.p w2.s w3.p w3.s) so a
- * fill is a plain offset lookup.
+ * engine's kernels consume experts in a backend-native encoding selected by
+ * K3ExpertQ.wfmt: the ST cache stays MXFP4 + E8M0 scales (k3_cache.c,
+ * untouched), and THIS source stores the IQ1_S slices AS-IS - no requant, no
+ * transform - and tags every served expert K3_EXPERT_IQ1S so k3_moe dispatches
+ * to k3_matmul_iq1_s. The architect's fix directive chose this over the D2a
+ * requant: the requant was measured at 13.3% mean per-element error on the
+ * real bytes (a transform the reference implementation does not have), and
+ * removing it also deletes the per-admit dequant+requant compute and shrinks
+ * expert storage ~2.72x (6,451,200 B per expert triple vs 17,547,264 B).
  *
  * w1 = ffn_gate_exps (gate), w3 = ffn_up_exps (up), w2 = ffn_down_exps (down):
  * checked against k3_load.h's run order and gguf_expert_orientation.md, where
  * the dims themselves discriminate the orientation (gate/up are [I][L] per
  * expert, down is [L][I] - exactly the engine's w1/w3 vs w2 layouts).
  *
+ * SLOT LAYOUT: the canonical run order inside a slot is w1 then w2 then w3
+ * (k3_load.h's measured layout; K3ExpertQ maps p1=w1, p2=w2, p3=w3), each a
+ * raw IQ1_S byte span of rows * ceil(cols/256)*50 bytes (rows are padded to
+ * the 256-block exactly as the on-disk bytes are; k3_matmul_iq1_s skips the
+ * padding). A fill is a plain pread of the three windows straight into the
+ * slot - no transient, no transform.
+ *
  * CACHE DISCIPLINE (mirrors k3_cache): LRU slots, INFLIGHT reservation before a
  * fill, publish only after a successful fill, nslot >= topk+1 enforced so a
  * token's working set can never be evicted mid-matmul. The fills are SERIAL
- * (one reusable fp32 transient): the reads are page-cache hits and the
- * dequant+requant is CPU-bound, so a parallel fill would only multiply the
- * transient; the INFLIGHT state machine is still the real one, so a later
- * parallelization cannot break it.
+ * (plain page-cache reads; the INFLIGHT state machine is the real one, so a
+ * later parallelization cannot break it).
  */
 #ifndef K3_GGUF_EXPERT_H
 #define K3_GGUF_EXPERT_H
@@ -48,15 +57,8 @@ typedef struct {
     uint64_t clock;
 
     /* Per-matrix geometry (identical for every expert of every layer). */
-    int rows[3], cols[3];       /* logical [out][in] per matrix      */
-    int64_t p_off[3], s_off[3]; /* offsets of packed/scales in a slot*/
-    int64_t p_bytes[3], s_bytes[3];
-
-    /* One reusable transient: the raw IQ1_S window + the fp32 dequant rows. */
-    unsigned char *raw;
-    size_t raw_cap;
-    float *f32;
-    size_t f32_cap;
+    int rows[3], cols[3];         /* logical [out][in] per matrix      */
+    int64_t i_off[3], i_bytes[3]; /* IQ1_S byte span of each matrix in a slot */
 
     /* stats, same field names as K3Cache so the run loop reads either */
     uint64_t hits, misses, evictions, bytes_read, prefetch_reads;

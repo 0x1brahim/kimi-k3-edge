@@ -59,7 +59,8 @@ int k3_mxfp4_quant(unsigned char *packed, unsigned char *scales, const float *w,
      * [r*cols/2, (r+1)*cols/2) and its own scales[r*g .. r*g+g), and no row
      * reads another row's output, so splitting the outer loop at ROW boundaries
      * cannot change a single output byte; the per-group math inside a row is
-     * untouched. This is the expert-admit requant hot loop (49 G vals/token). */
+     * untouched. (Test-only path since the fix wave: the GGUF expert admit no
+     * longer requants.) */
     int err = 0;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)

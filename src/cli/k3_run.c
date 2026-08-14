@@ -13,8 +13,9 @@
  *   instead, which comes from
  *   getrusage after the run. Fully resident, the weights are 108.81 GB of bf16 trunk plus
  *   4.70 GB of embed and lm_head, so 113.49 GB; streamed, the resident set is whatever
- *   budget is given, down to about 8.2 GB. The 1.45 TB of routed experts is never
- *   resident at any budget.
+ *   budget is given, down to about 8.2 GB. The routed experts (1.45 TB in the
+ *   ST cache's MXFP4 encoding, 0.53 TB as native IQ1_S on the GGUF path) are
+ *   never resident at any budget.
  *
  * THIS ENGINE IS I/O BOUND at small budgets and roughly balanced at large ones. The
  *   measured I/O share runs 40.9%-60.6% across the 12-rung ladder (docs/data/), dropping
@@ -1067,8 +1068,8 @@ int main(int argc, char **argv)
     memset(&cache, 0, sizeof cache);
     memset(&gesrc, 0, sizeof gesrc);
     if (gguf_model) {
-        /* D2a: the GGUF expert source dequantizes IQ1_S -> fp32 -> MXFP4 at cache
-         * admit; kernels and K3ExpertQ stay untouched. */
+        /* fix wave: the GGUF expert source stores the IQ1_S slices AS-IS (no
+         * requant) and k3_matmul_iq1_s consumes the slot bytes natively. */
         if (k3_gguf_expert_src_init(&gesrc, &gg, &c, (int64_t)(cache_gb * 1e9)) != 0)
             return 1;
         w.exp_src = &gesrc.src;
@@ -1084,10 +1085,16 @@ int main(int argc, char **argv)
         const int nslot = gguf_model ? gesrc.nslot : cache.nslot;
         const double slotb = gguf_model ? (double)gesrc.slot_bytes
                                         : (double)cache.slot_bytes;
-        printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB "
+        /* the pool size is backend-dependent: the ST cache's MXFP4 experts are
+         * 17.55 MB each (1.45 TB total); the GGUF source's native IQ1_S slots
+         * are 6.45 MB (0.53 TB total on disk). Compute it from the real
+         * geometry rather than printing a fixed number. */
+        const double pool_gb =
+            gguf_model ? (double)92 * c.n_experts * slotb / 1e9 : 1.45e3;
+        printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the %.2f TB "
                "expert pool)\n\n",
                nslot, slotb / 1e6, (double)nslot * slotb / 1e9,
-               100.0 * nslot / (double)(92 * c.n_experts));
+               100.0 * nslot / (double)(92 * c.n_experts), pool_gb / 1e3);
     }
 
     /* ---- buffers ----

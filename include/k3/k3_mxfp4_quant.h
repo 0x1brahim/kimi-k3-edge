@@ -1,8 +1,10 @@
 /* k3_mxfp4_quant.h - quantise fp32 into OCP MX FP4 (E2M1) + E8M0 scales.
  *
- * The inverse of k3_mxfp4_dequant (k3.h): the engine's routed experts are consumed
- * packed, and the GGUF path (D2a) must produce that exact packing from the fp32
- * dequant of the GGUF IQ1_S expert slices at cache-admit time.
+ * The inverse of k3_mxfp4_dequant (k3.h). After the fix wave removed the
+ * D2a GGUF cache-admit requant (the GGUF source now stores IQ1_S natively),
+ * this module is exercised by the unit tests only: the requant goldens and
+ * the synthetic stress in test_gguf_par/test_gguf_bind, against the python
+ * golden in tests/fixtures/mxfp4_quant_golden.bin.
  *
  * SEMANTICS (byte-for-byte, mirrored from tools/make_tiny_checkpoint.py's
  * mxfp4_quant; tests/fixtures/mxfp4_quant_golden.bin holds python-generated

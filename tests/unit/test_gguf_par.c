@@ -33,6 +33,7 @@
 #include "k3_gguf.h"
 #include "k3_gguf_dequant.h"
 #include "k3_mxfp4_quant.h"
+#include "iq1s_grid.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -425,6 +426,226 @@ static void run_tiny_gguf(const char *file)
     k3_gguf_close(&g);
 }
 
+/* ------------------------------------------------------------ iq1s kernel -- */
+/* k3_matmul_iq1_s (the fix wave's native expert kernel) bit-identity gate:
+ * the row-parallel OpenMP split must be bit-identical to the single-thread
+ * path, and the VALUES must equal an independent dequant (k3_gguf_dequant_-
+ * expert_slice, itself golden-verified against numpy) followed by a sequential
+ * fp32 dot - the kernel's inline dequant and accumulation order reproduce it
+ * bit for bit. Two legs:
+ *   - the tiny GGUF fixture's real expert windows (incl. the partial-block
+ *     padding path: 64-wide rows in 256-wide blocks). NOTE: with 64 rows the
+ *     kernel's `if (rows > 64)` guard keeps both calls serial, so THIS leg's
+ *     1-vs-N memcmp is vacuous for thread splitting - the values-vs-reference
+ *     compare is its real content, and the parallel split is proven by the
+ *     512-row synthetic leg below;
+ *   - a synthetic real-width matrix (3584 cols = 14 blocks/row, 512 rows) so
+ *     the parallel split gets real work at every thread count. The synthetic
+ *     reference uses an inline dequant mirror; its job is only to make the
+ *     thread comparison meaningful (the fixture leg carries the independent
+ *     reference).
+ *
+ * TSan NOTE (crit-fix-1 F8): TSan reports races on the OpenMP outline frames
+ * of this kernel (and of the pre-existing dequant/requant loops) because TSan
+ * does not model libgomp's futex dispatch/barrier; the reports are the known
+ * false-positive class - the kernel has disjoint per-row writes and a
+ * barrier-ordered region exit, and the 1-vs-8-thread memcmp gates pass on
+ * every run. */
+
+static void iq1s_ref_row(const unsigned char *row, int cols, const float *x,
+                         float *y)
+{
+    /* mirror of k3_matmul_iq1_s: per-256-block partial, then per-row
+     * accumulation, elements in dequant order (its job is the thread-identity
+     * reference for the synthetic leg; the fixture leg uses the independent
+     * slice dequant). */
+    const int nblk = (cols + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK;
+    float acc = 0.0f;
+    for (int b = 0; b < nblk; b++) {
+        const unsigned char *bl = row + (size_t)b * K3_GGUF_IQ1_S_BSZ;
+        const float d = k3_gguf_f16_to_f32(
+            (uint16_t)bl[0] | (uint16_t)((uint16_t)bl[1] << 8));
+        const unsigned char *qs = bl + 2;
+        const unsigned char *qh = bl + 2 + K3_GGUF_IQ1_S_QK / 8;
+        const int base = b * K3_GGUF_IQ1_S_QK;
+        float partial = 0.0f;
+        for (int ib = 0; ib < 8; ib++) {
+            const uint16_t qhb = (uint16_t)qh[2 * ib] |
+                                 (uint16_t)((uint16_t)qh[2 * ib + 1] << 8);
+            const float dl = d * (float)(2 * ((qhb >> 12) & 7) + 1);
+            const float delta = (qhb & 0x8000u) ? -0.125f : 0.125f;
+            for (int l = 0; l < 4; l++) {
+                const uint32_t idx = (uint32_t)qs[4 * ib + l] |
+                                     (((uint32_t)(qhb >> (3 * l)) & 7u) << 8);
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx);
+                const int e = base + 32 * ib + 8 * l;
+                if (e + 8 <= cols) {
+                    for (int j = 0; j < 8; j++)
+                        partial += dl * ((float)grid[j] + delta) * x[e + j];
+                } else {
+                    for (int j = 0; j < 8 && e + j < cols; j++)
+                        partial += dl * ((float)grid[j] + delta) * x[e + j];
+                }
+            }
+        }
+        acc += partial;
+    }
+    *y = acc;
+}
+
+/* one kernel comparison: same raw bytes and x at 1 and PAR_THREADS threads,
+ * plus (when ref != NULL) the sequential-fp32 reference. */
+static void cmp_iq1s(const char *what, const unsigned char *blk, int in, int rows,
+                     const float *x, const float *ref)
+{
+    float *y1 = (float *)malloc((size_t)rows * sizeof(float));
+    float *y2 = (float *)malloc((size_t)rows * sizeof(float));
+    if (!y1 || !y2) {
+        fail("%s: oom", what);
+        free(y1);
+        free(y2);
+        return;
+    }
+    set_threads(1);
+    k3_matmul_iq1_s(y1, x, blk, in, rows);
+    set_threads(PAR_THREADS);
+    k3_matmul_iq1_s(y2, x, blk, in, rows);
+    if (memcmp(y1, y2, (size_t)rows * sizeof(float)) != 0)
+        fail("%s: k3_matmul_iq1_s differs between 1 and %d threads", what,
+             PAR_THREADS);
+    if (ref && memcmp(y1, ref, (size_t)rows * sizeof(float)) != 0)
+        fail("%s: k3_matmul_iq1_s differs from the sequential fp32 reference",
+             what);
+    free(y1);
+    free(y2);
+}
+
+/* tiny-fixture leg: every expert tensor of blk.1, experts 0..2, whole windows
+ * through the expert-slice dequant (independent) + sequential fp32 dot. */
+static void run_iq1s_tiny(const char *file)
+{
+    K3Gguf g;
+    memset(&g, 0, sizeof g);
+    if (k3_gguf_open_file(&g, file) != 0) {
+        fail("tiny GGUF open failed: %s", file);
+        return;
+    }
+    static const char *mats[3] = {"blk.1.ffn_gate_exps.weight",
+                                  "blk.1.ffn_up_exps.weight",
+                                  "blk.1.ffn_down_exps.weight"};
+    for (int m = 0; m < 3; m++) {
+        const K3Tensor *kt = k3_gguf_find(&g, mats[m]);
+        if (!kt || kt->ndim != 3 || kt->shape[2] < 3) {
+            fail("%s missing or too small", mats[m]);
+            continue;
+        }
+        const int cols = (int)kt->shape[0], rows = (int)kt->shape[1];
+        const int64_t per = kt->nbytes / kt->shape[2];
+        /* the whole tensor's raw bytes: the slice dequant offsets expert e by
+         * t->data + e*per (in-memory pointer), and the kernel window is the
+         * same bytes */
+        static unsigned char raw[1 << 18];
+        if (kt->nbytes > (int64_t)sizeof raw) {
+            fail("%s: tensor too large for the scratch", mats[m]);
+            continue;
+        }
+        if (cols > 4096 ||
+            (int64_t)rows * ((cols + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK) *
+                    K3_GGUF_IQ1_S_QK >
+                (int64_t)(1 << 18)) {
+            fail("%s: fixture too wide for the fp32/x/ref scratch", mats[m]);
+            continue;
+        }
+        if (k3_gguf_read(&g, kt, raw) != kt->nbytes) {
+            fail("%s: tensor read", mats[m]);
+            continue;
+        }
+        for (int64_t e = 0; e < 3; e++) {
+            /* independent dequant (module, numpy-golden-verified) */
+            static float f32[1 << 18];
+            K3GgufTensor gt;
+            K3GgufExpect ex;
+            memset(&gt, 0, sizeof gt);
+            gt.ggml_type = K3_GGUF_TYPE_IQ1_S;
+            gt.ndim      = kt->ndim;
+            for (int d = 0; d < 4; d++) gt.ne[d] = kt->shape[d];
+            gt.nbytes = kt->nbytes;
+            gt.data   = raw;
+            memset(&ex, 0, sizeof ex);
+            ex.ndim = kt->ndim;
+            for (int d = 0; d < 4; d++) ex.ne[d] = kt->shape[d];
+            if (k3_gguf_dequant_expert_slice(&gt, e, K3_GGUF_DEQ_F32, f32,
+                                             &ex) != 0) {
+                fail("%s e%lld: expert slice dequant", mats[m], (long long)e);
+                continue;
+            }
+            /* deterministic x, then the sequential fp32 reference. The order
+             * must mirror the kernel's: per-256-block partial, then per-row
+             * accumulation (the kernel dequantizes per block on the fly). */
+            static float x[4096], ref[4096];
+            uint32_t st = 0x9E3779B9u ^ (uint32_t)(m * 101 + e * 7 + 1);
+            for (int i = 0; i < cols; i++) {
+                st = st * 1664525u + 1013904223u;
+                x[i] = ((float)(st >> 8) / 16777216.0f - 0.5f) * 0.08f;
+            }
+            const int prow = (cols + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK *
+                             K3_GGUF_IQ1_S_QK;
+            const int nblk = (cols + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK;
+            for (int r = 0; r < rows; r++) {
+                float acc = 0.0f;
+                for (int b = 0; b < nblk; b++) {
+                    const int base = b * K3_GGUF_IQ1_S_QK;
+                    float partial = 0.0f;
+                    for (int i = base; i < base + K3_GGUF_IQ1_S_QK && i < cols;
+                         i++)
+                        partial += f32[r * prow + i] * x[i];
+                    acc += partial;
+                }
+                ref[r] = acc;
+            }
+            char what[96];
+            snprintf(what, sizeof what, "%s e%lld (%dx%d)", mats[m],
+                     (long long)e, rows, cols);
+            cmp_iq1s(what, raw + e * per, cols, rows, x, ref);
+        }
+    }
+    printf("  tiny GGUF %s: k3_matmul_iq1_s bit-identical vs reference\n",
+           file);
+    k3_gguf_close(&g);
+}
+
+/* synthetic real-width leg: 512 rows x 3584 cols of random IQ1_S blocks,
+ * thread bit-identity + the inline-dequant reference (mirror; the fixture leg
+ * carries the independent reference). */
+static void run_iq1s_stress(void)
+{
+    const int rows = 512, cols = 3584;
+    const size_t rowb = (size_t)(cols / K3_GGUF_IQ1_S_QK) * K3_GGUF_IQ1_S_BSZ;
+    static unsigned char blk[512 * 14 * 50];
+    static float x[4096], ref[4096];
+    uint32_t st = 12345;
+    for (size_t i = 0; i < sizeof blk; i++) {
+        st = st * 1664525u + 1013904223u;
+        blk[i] = (unsigned char)(st >> 24);
+    }
+    /* every block's d is a sane fp16 (1.0): the random bytes above would give
+     * random exponents including NaN/Inf patterns, which are legal bytes but
+     * make the reference comparison meaningless. */
+    for (int r = 0; r < rows; r++)
+        for (int b = 0; b < cols / K3_GGUF_IQ1_S_QK; b++) {
+            blk[(size_t)r * rowb + (size_t)b * K3_GGUF_IQ1_S_BSZ] = 0x00;
+            blk[(size_t)r * rowb + (size_t)b * K3_GGUF_IQ1_S_BSZ + 1] = 0x3C;
+        }
+    for (int i = 0; i < cols; i++) {
+        st = st * 1664525u + 1013904223u;
+        x[i] = ((float)(st >> 8) / 16777216.0f - 0.5f) * 0.08f;
+    }
+    for (int r = 0; r < rows; r++)
+        iq1s_ref_row(blk + (size_t)r * rowb, cols, x, &ref[r]);
+    cmp_iq1s("synthetic 512x3584", blk, cols, rows, x, ref);
+    printf("  iq1s stress: 512x3584 matrix bit-identical across threads\n");
+}
+
 /* ------------------------------------------------------------------ main -- */
 
 int main(int argc, char **argv)
@@ -460,6 +681,9 @@ int main(int argc, char **argv)
     snprintf(path, sizeof path, "%s/tiny_gguf_bf16trunk/tiny-k3-00001-of-00001.gguf",
              argv[1]);
     run_tiny_gguf(path);
+    snprintf(path, sizeof path, "%s/tiny_gguf/tiny-k3-00001-of-00001.gguf", argv[1]);
+    run_iq1s_tiny(path);
+    run_iq1s_stress();
 
     printf("\n%s (%d failures)\n", nfail == 0 ? "PARALLEL BIT-IDENTITY PASSED"
                                               : "PARALLEL BIT-IDENTITY FAILED",
