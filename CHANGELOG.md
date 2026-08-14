@@ -12,19 +12,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shard-set reader (`src/io/k3_gguf.c`) indexes all 2,573 tensors of the 14-shard
   594 GB file and derives the config from shard-1 metadata; the tokenizer loads from
   shard-1 metadata too, so no `config.json`, no `tiktoken.model` and no `--tok` are
-  needed. (On a 1-bit-quantised checkpoint, greedy decoding — the engine's only
-  sampling mode — is expected to fall into repetitive loops; the README says so
-  plainly.)
+  needed. (Greedy-only remains the engine's only decode mode; the earlier claim
+  that repetitive loops on a 1-bit checkpoint are expected behavior is corrected in
+  `### Fixed` below — the loops were the requant bug, now fixed.)
 - **GGUF weight path**: the trunk is streamed per layer with Q8_0/F32 dequantised to
-  bf16 into one reusable layer buffer; the routed experts are dequantised from IQ1_S
-  and requantised to the engine's native MXFP4 at cache admit, so the existing
-  matmul kernels and expert cache serve both paths unchanged. The dequant/requant
-  hot loops are OpenMP-parallel with bit-identical output at any thread count.
+  bf16 into one reusable layer buffer; the routed experts are cached as
+  backend-native IQ1_S blocks and dotted by a native IQ1_S matmul
+  (`k3_matmul_iq1_s`), so the safetensors path keeps its MXFP4 experts and kernels
+  unchanged. The dequant/trunk hot loops are OpenMP-parallel with bit-identical
+  output at any thread count.
 - **GGUF parity gates**: weightless tiny-fixture gates for the new path — argmax
   113/113 within the repo budget on single and multi-shard fixtures (single vs
   multi bit-identical), a bit-exact trunk sub-gate against the safetensors bytes,
-  and a 96/96 per-expert requant self-consistency gate (`test_gguf_gate`, `make
-  parity-tiny`, `make tok-gguf`).
+  and a 96/96 per-expert gate against a raw fp32 dequant reference (`test_gguf_gate`,
+  `make parity-tiny`, `make tok-gguf`).
+
+### Fixed
+
+- **GGUF 1-bit experts: the degenerate loop was a bug, not "expected 1-bit
+  behavior"** (`be394b7`). A bake-off against an independent oracle — llama.cpp
+  PR #26185 (kimi-k3), unsloth's own runner for this file — on the same 14-shard
+  GGUF, bare "Hi", greedy, diverged at the first generated token (',' vs '.') and
+  continued coherently (", I'm a") where the engine looped (". 1. 7. 0. 7. 7. 1.").
+  The cause: the IQ1_S→MXFP4 (E2M1) expert requant at cache admit, measured at 13.3%
+  mean per-element weight error on the real bytes (structural group-range
+  clipping), flattening the logits and flipping near-tie top tokens. The fix: a
+  native IQ1_S matmul (`k3_matmul_iq1_s`, math matched to llama.cpp's reference, no
+  transform), backend-native cache blocks tagged at the dispatch point (6.45 MB vs
+  17.55 MB per expert triple; ~1,550 vs 569 slots at `--cache-gb 10`), and GATE 2
+  de-mirrored to a raw fp32 dequant reference (rel-L2 ~5e-7 vs 1e-4 budget). Rerun:
+  20/20 tokens EXACT match vs the oracle, token-1 ','; 68.3 s/token, peak RSS
+  17.84 GB. The safetensors/MXFP4 path and its fixtures are byte-unchanged.
+- **A_log convention deviation fixed for correctness** (`be394b7`): the GGUF ships
+  `ssm_a = -exp(A_log)`; the finder now unfolds `A_log = ln(-ssm_a)` at bind with
+  fail-loud on non-negative values. Measured behaviorally insensitive at top-10, but
+  a real convention deviation — fixed with a unit so it cannot regress silently.
 
 ## [1.0.0] - 2026-08-07
 

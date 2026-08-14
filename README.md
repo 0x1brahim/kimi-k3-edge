@@ -516,21 +516,30 @@ Four things to know:
   keys instead, and no `tiktoken.model` either — no `--tok` is needed (and
   `--config` is refused on this path).
 - **The same streaming economics apply.** The trunk is streamed per layer and
-  dequantised to bf16 into one reusable layer buffer; the routed experts are
-  dequantised from IQ1_S and requantised to the engine's native MXFP4 at cache
-  admit, so the existing matmul kernels and the expert cache serve both paths
-  unchanged.
+  dequantised to bf16 into one reusable layer buffer; the routed experts are cached
+  as **backend-native IQ1_S blocks** and dotted directly by a native IQ1_S matmul
+  (`k3_matmul_iq1_s`, math matched to llama.cpp's reference — no requant; the
+  safetensors path keeps its packed MXFP4 experts and kernels unchanged).
 - **Budgets work as usual.** On a 40 GB machine, `--trunk-gb 3 --cache-gb 10` plans
-  17.73 GB and measures 17.87 GB peak RSS. `--layers N` slices are for smoke-testing
+  17.73 GB and measures 17.84 GB peak RSS. `--layers N` slices are for smoke-testing
   the machinery only — the run itself prints that its output is NOT the full model.
 - **One honest caveat.** GGUF is a lossy, quantised checkpoint, and this engine is
-  greedy-only. Greedy sampling on a 1-bit-quantised checkpoint is expected to fall
-  into repetitive loops; that is the sampling regime, not an engine defect.
+  greedy-only — no sampling flags. Two clarifications, kept apart: (1) the
+  repetitive loops seen in early GGUF acceptance runs were a **real bug** — a lossy
+  IQ1_S→MXFP4 requant at cache admit (measured 13% per-element weight error) that
+  flipped the model's top token — now fixed by dotting the native IQ1_S blocks
+  directly (commit `be394b7`), with the rerun verified token-for-token against an
+  independent llama.cpp reference (20/20, starting at the first token). (2) Greedy
+  decoding on a 1-bit checkpoint can still be less diverse than a sampling-based
+  decode; that is a statement about sampling regimes, not engine correctness, and
+  it is not a measured result here.
 
 The GGUF path is covered by the weightless parity gates — `make parity-tiny`,
 `test_gguf_gate` and `make tok-gguf` — which prove argmax-identical logits on single
 and multi-shard tiny fixtures within the repo budget, a bit-exact trunk sub-gate
-against the safetensors bytes, and a per-expert requant self-consistency gate.
+against the safetensors bytes, and a per-expert GATE 2 comparing the native IQ1_S dot
+against a **raw fp32 dequant reference** (rel-L2 ~5e-7 against a 1e-4 budget — the
+reference is deliberately not a requant mirror).
 
 ## Choosing a preset
 
@@ -621,8 +630,8 @@ needs nothing at all, and `--layers N` runs against partial shard sets.
 **Can I run from a GGUF checkpoint?** Yes — point the engine at a GGUF shard directory
 (or a single `.gguf` file) and both the config and the tokenizer come from shard-1
 metadata automatically: no pack step, no `config.json`, no `--tok`. See
-[GGUF checkpoints](#gguf-checkpoints) for the command and one honest caveat about
-quantised checkpoints and greedy decoding.
+[GGUF checkpoints](#gguf-checkpoints) for the command and the honest caveat about
+greedy decoding on a quantised checkpoint.
 
 **macOS, Windows, WSL?** The engine targets Linux. The tokenizer and config reader are
 portable C99 and are built portably in CI.
