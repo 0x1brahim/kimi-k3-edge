@@ -93,7 +93,11 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
 
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
+              src/core/k3_gguf_dequant.c \
+              src/core/k3_mxfp4_quant.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
+              src/io/k3_gguf.c \
+              src/io/k3_gguf_map.c src/io/k3_gguf_expert.c \
               src/cache/k3_cache.c \
               src/model/k3_bind.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
@@ -102,7 +106,8 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model
+UNIT_TESTS := test_ops test_cache test_st test_cfg test_tok scale_test k3_model \
+              test_gguf_dequant test_gguf_par test_gguf test_tok_gguf test_gguf_bind test_gguf_gate
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -144,10 +149,44 @@ $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
 $(BIN)/test_st: tests/unit/test_st.c $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_gguf: tests/unit/test_gguf.c $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_gguf_dequant: tests/unit/test_gguf_dequant.c \
+                          $(BUILD)/src/core/k3_gguf_dequant.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_gguf_par: tests/unit/test_gguf_par.c \
+                    $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_gguf_bind: tests/unit/test_gguf_bind.c $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/io/k3_gguf_map.o \
+                    $(BUILD)/src/io/k3_gguf_expert.o $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/model/k3_bind.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_gguf_gate: tests/unit/test_gguf_gate.c $(BUILD)/src/io/k3_gguf.o \
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/io/k3_gguf_map.o \
+                    $(BUILD)/src/io/k3_gguf_expert.o $(BUILD)/src/core/k3_gguf_dequant.o \
+                    $(BUILD)/src/core/k3_mxfp4_quant.o $(BUILD)/src/model/k3_bind.o \
+                    $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $< -o $@
+
+# The GGUF tokenizer test links the wave-1 gguf reader (POSIX, so not the portable
+# C99 rule above). Its synthetic fixtures run everywhere; the real-file gate SKIPs
+# when the model directory is absent, so `make test` stays weightless-green.
+$(BIN)/test_tok_gguf: tests/unit/test_tok_gguf.c $(BUILD)/src/io/k3_gguf.o | $(BIN)
+	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
@@ -169,12 +208,17 @@ test: $(TEST_BINS)
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+	@echo "== gguf dequant ========";  ./$(BIN)/test_gguf_dequant $(FIXTURES)/gguf_dequant_golden.bin
+	@echo "== gguf par bit-identity =";  ./$(BIN)/test_gguf_par $(FIXTURES)
+	@echo "== gguf reader ==";       ./$(BIN)/test_gguf
+	@echo "== gguf bind ==";         ./$(BIN)/test_gguf_bind $(FIXTURES)/mxfp4_quant_golden.bin
+	@echo "== gguf parity gates ==";  ./$(BIN)/test_gguf_gate $(FIXTURES)
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \
 	      ./$(BIN)/test_cfg reject $(FIXTURES)/cfg/$$f.json || exit 1; \
 	  done
-	@echo "== tokenizer =="; \
+	@echo "== tokenizer ==========="; \
 	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	      ./$(BIN)/test_tok $(TOK_FILES) roundtrip src/core/k3_ops.c; \
 	  else \
@@ -182,7 +226,8 @@ test: $(TEST_BINS)
 	      echo "           the vocabulary ships with the checkpoint, not with this"; \
 	      echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
 	  fi
-	@echo "== real dimensions ==";   ./$(BIN)/scale_test
+	@echo "== gguf tokenizer ======"; ./$(BIN)/test_tok_gguf
+	@echo "== real dimensions =====";   ./$(BIN)/scale_test
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
@@ -209,6 +254,23 @@ $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)
 ## tok: tokenizer parity against the reference implementation
 tok: $(BIN)/test_tok
 	@$(PYTHON) tools/tok_parity.py ./$(BIN)/test_tok
+
+## tok-gguf: the GGUF-metadata tokenizer against the tiktoken oracle. Needs the
+## real shard set (K3_GGUF_REAL) and the HF tokenizer files (K3_TOK_FILES); both
+## default to the local unsloth checkout.
+tok-gguf: $(BIN)/test_tok_gguf
+	@K3_GGUF_REAL=$${K3_GGUF_REAL:-/workspace/unsloth/Kimi-K3-GGUF/UD-IQ1_S} \
+	 K3_TOK_FILES=$${K3_TOK_FILES:-/workspace/unsloth/Kimi-K3-GGUF} \
+	 $(PYTHON) tools/tok_parity_gguf.py ./$(BIN)/test_tok_gguf
+
+## parity-tiny: PARITY GATE 1 on the committed tiny fixtures (ST path vs GGUF
+## path through bin/k3, same-bytes references, the bit-exact sub-gate and the
+## measured-encoding-noise bounds). Weightless: no real model needed.
+## Needs numpy: run as `make parity-tiny PYTHON=.venv/bin/python` when the
+## system python lacks the repo venv (same convention as the tok targets).
+parity-tiny: $(CLI_BIN) $(BIN)/test_gguf_gate
+	@$(PYTHON) tools/tiny_parity.py
+	@./$(BIN)/test_gguf_gate $(FIXTURES)
 
 ## cfg: config reader against both supported config layouts
 cfg: $(BIN)/test_cfg

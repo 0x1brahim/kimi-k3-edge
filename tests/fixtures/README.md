@@ -18,6 +18,12 @@ Total is about 12 MB.
 | `golden/` | none | conformance comparison | `tools/ref_forward.py`, real weights |
 | `gates/` | none | recorded gate output | the test binaries |
 | `expert_trace.bin` | 800 KB | `tools/sim_cache.py` | a real model run with `--dump-cache-trace` |
+| `tiny_st/` | 4.8 MB | `test_gguf_gate`, `tools/tiny_parity.py` | `tools/make_tiny_checkpoint.py --aligned-dims` |
+| `tiny_gguf/` | 3.1 MB | `test_gguf_gate`, `test_tok_gguf` (via `bin/k3`) | `tools/make_tiny_gguf.py` |
+| `tiny_gguf_multi/` | 3.1 MB | `test_gguf_gate` | same |
+| `tiny_gguf_bf16trunk/` | 8.9 MB | `test_gguf_gate` | same |
+| `gguf_gate2_golden.bin` | 79 KB | `test_gguf_gate` | same |
+| `tiny_gguf_manifest.json` | 1 KB | documentation | same |
 
 ## Regenerating
 
@@ -30,7 +36,20 @@ python tools/emit_fixtures.py        # ops/ and mxfp4.json
 python tools/make_k3_oracle.py       # ref_k3.json, tiny_k3.*
 python tools/make_cache_fixture.py   # cache/
 python tools/make_st_fixture.py      # st/
+python tools/make_tiny_checkpoint.py tests/fixtures/tiny_st --aligned-dims  # the ST parity half
+python tools/make_tiny_gguf.py       # the GGUF parity fixtures + gate2 golden
 ```
+
+The tiny GGUF/ST pair is the P3 parity pair: the same tiny arch (13 layers, hidden 128,
+experts 8 top2 shared2, latent 64, moe_inter 64, vocab 256) written through the two
+production encodings (safetensors: bf16 trunk + MXFP4 experts; GGUF: Q8_0 trunk +
+IQ1_S experts + F32 vectors). The arch uses `--aligned-dims` (kda_head_dim/qk_nope/
+v_head 32) because the GGUF map's Q8_0 dequant writes unpadded rows and requires
+32-multiple row lengths; the oracle's 16/24 widths do not occur in the real file.
+`make parity-tiny` runs the full PARITY GATE 1 + the bit-exact sub-gate; `make test`
+runs the committed `test_gguf_gate` (reader sanity, bit-exact trunk, PARITY GATE 2
+expert self-consistency, full-model same-bytes gates) weightlessly.
+
 
 `expert_trace.bin` cannot be regenerated without the real checkpoint; capture a new one
 with `./bin/k3 <model_dir> --dump-cache-trace tests/fixtures ...`.

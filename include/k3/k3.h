@@ -316,14 +316,28 @@ static inline size_t k3_row_bytes(int wdt, int in)
  */
 
 /* ---- streamed experts -------------------------------------------------------------
- * One routed expert as it sits in the cache: still MXFP4, never widened. A dequantised
- * expert is 132 MB against 17.55 MB packed, and a token touches 1,472 of them, so
- * widening on load would need 194 GB per token. k3_matmul_mxfp4 consumes these directly.
+ * One routed expert as it sits in the cache. wfmt tags the on-die encoding:
+ * K3_EXPERT_MXFP4 (0) is the safetensors cache's native form - packed nibbles
+ * plus E8M0 scales, consumed by k3_matmul_mxfp4 - and K3_EXPERT_IQ1S is the
+ * GGUF backend's native form: the RAW IQ1_S block bytes exactly as they sit on
+ * disk (no requant, no transform), consumed by k3_matmul_iq1_s. A dequantised
+ * expert is 132 MB against 17.55 MB packed MXFP4 (6.45 MB as IQ1_S), and a
+ * token touches 1,472 of them, so widening on load would need 194 GB per
+ * token; both kernels consume the packed bytes directly.
+ *
+ * TAG DISCIPLINE: wfmt == 0 is MXFP4, so a zero-initialised K3ExpertQ is
+ * MXFP4 by construction. k3_cache.c (the ST backend) never writes the tag and
+ * is untouched; the GGUF source (k3_gguf_expert.c) sets K3_EXPERT_IQ1S in its
+ * fill. Consumers zero the struct before asking a source to fill it.
  */
+enum { K3_EXPERT_MXFP4 = 0, K3_EXPERT_IQ1S = 1 };
+
 typedef struct {
-    const unsigned char *p1, *s1;        /* w1 gate, packed and E8M0 scales           */
-    const unsigned char *p3, *s3;        /* w3 up                                     */
-    const unsigned char *p2, *s2;        /* w2 down                                   */
+    int wfmt;                        /* K3_EXPERT_*, selects the matmul       */
+    const unsigned char *p1, *s1;    /* w1 gate: packed+scales (MXFP4) or the
+                                        IQ1_S block bytes (s1 unused)         */
+    const unsigned char *p3, *s3;    /* w3 up                                 */
+    const unsigned char *p2, *s2;    /* w2 down                               */
 } K3ExpertQ;
 
 /* A source of experts. get() must leave the returned pointers valid until the caller
@@ -564,6 +578,18 @@ void k3_mxfp4_dequant(float *out, const unsigned char *packed,
  * becoming 132 MB. See the comment on the definition. */
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group);
+
+/* y[rows] = W[rows][in] . x[in], with W read directly as RAW IQ1_S blocks, the
+ * GGUF backend's native expert encoding (50 bytes per 256 values, row-major, rows
+ * padded to the 256-block exactly as the on-disk bytes are: row stride is
+ * ceil(in/256)*50 bytes, and values beyond `in` in the last partial block are
+ * padding and contribute nothing). Dequantizes per 256-block on the fly - the
+ * dequant math is identical to k3_gguf_dequant's (and llama.cpp's
+ * dequantize_row_iq1_s) - and accumulates in fp32 in block/row order, the same
+ * accumulation class as llama.cpp's vec_dot_iq1_s_q8_K. Never materialises the
+ * fp32 matrix: a streamed expert stays 6.45 MB instead of becoming 132 MB. */
+void k3_matmul_iq1_s(float *y, const float *x, const unsigned char *blk,
+                     int in, int rows);
 
 #ifdef __cplusplus
 }

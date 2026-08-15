@@ -22,6 +22,10 @@ The dtype of every tensor mirrors src/model/k3_bind.c's reqw/reqn split exactly:
   experts -> MXFP4 U8 (packed + scale), low-nibble-first, per-32 scale
 
 Usage: make_tiny_checkpoint.py <out_dir> [--seed N] [--prompt-ids a,b,c]
+       [--aligned-dims]
+
+--aligned-dims switches the tiny arch to the GGUF-compatible variant (see
+ALIGNED_DIMS below). The default output is unchanged.
 """
 from __future__ import annotations
 
@@ -41,6 +45,23 @@ from k3_ref import K3Model, tiny_config  # noqa: E402
 GROUP = 32
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                  -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
+
+# The GGUF-compatible tiny arch (P3 test-dev). The oracle dims below (kda_head_dim
+# 16, qk_nope 24, v_head 16) predate GGUF support and cannot run through the GGUF
+# map: its Q8_0 dequant writes UNPADDED rows, so every row length (ne0) must be a
+# multiple of the 32-block, and the composite kv_b reassembly additionally needs
+# qk_nope/v_head multiples of 32 (k3_gguf_map.c row_aligned/kvb_validate). The real
+# file's dims are all block-aligned; these three are the only non-aligned ones in
+# the tiny arch, and the real file never carries such shapes. The variant keeps
+# every architectural feature and the named tiny dims (hidden 128, layers 13,
+# vocab 256, experts 8 top2 shared2, latent 64, moe_inter 64, dense_inter 96,
+# attn_res 3, first_dense 1, situ 4.0/25.0) and widens only the head widths that
+# the GGUF path requires to be 32-multiples.
+ALIGNED_DIMS = dict(
+    kda_head_dim=32,       # 16 -> 32: f_a/f_b rows (Q8_0 ne0) and o_norm/dt_bias
+    qk_nope_head_dim=32,   # 24 -> 32: attn_k_b rows (kv_b composite)
+    v_head_dim=32,         # 16 -> 32: attn_v_b rows (kv_b composite)
+)
 
 REQN_LEAVES = {
     "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa",
@@ -195,9 +216,9 @@ def is_reqn(eng: str, name: str) -> bool:
 
 
 # ---------------------------------------------------------------- build
-def build(seed: int):
+def build(seed: int, **cfg_kw):
     torch.manual_seed(seed)
-    cfg = tiny_config(moe_intermediate_size=64)
+    cfg = tiny_config(moe_intermediate_size=64, **cfg_kw)
     model = K3Model(cfg).to(torch.float32).eval()
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -236,10 +257,13 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--prompt-ids", default="3,7,11,5,9")
+    ap.add_argument("--aligned-dims", action="store_true",
+                    help="use the GGUF-compatible aligned-dims tiny arch "
+                         "(ALIGNED_DIMS); make_tiny_gguf.py requires this")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
-    cfg, model = build(a.seed)
+    cfg, model = build(a.seed, **ALIGNED_DIMS if a.aligned_dims else {})
     ids = [int(v) for v in a.prompt_ids.split(",") if v != ""]
     print("model: hidden %d, layers %d, vocab %d, experts %d, moe_inter %d" %
           (cfg.hidden_size, cfg.num_hidden_layers, cfg.vocab_size,

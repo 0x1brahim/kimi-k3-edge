@@ -140,6 +140,7 @@ component at a time.
   - [Exit codes](#exit-codes)
   - [Environment variables](#environment-variables)
   - [Worked examples](#worked-examples)
+  - [GGUF checkpoints](#gguf-checkpoints)
 - [Choosing a preset](#choosing-a-preset)
 - [Reading the run report](#reading-the-run-report)
 - [Common questions](#common-questions)
@@ -496,6 +497,60 @@ systemd-run --scope --user -q -p MemoryMax=8G -p MemorySwapMax=0 \
            --ids 1008,10484,318,15383,387 --gen 8 --incremental
 ```
 
+### GGUF checkpoints
+
+The engine also reads **GGUF shard sets directly** — notably the unsloth UD-IQ1_S
+releases of Kimi K3 — with no conversion and no pack step. Point it at the model
+directory; a single `.gguf` file is accepted too:
+
+```bash
+./bin/k3 /path/to/Kimi-K3-GGUF/UD-IQ1_S \
+         --prompt "Hi" --gen 20 --incremental \
+         --trunk-gb 3 --cache-gb 10
+```
+
+Five things to know:
+
+- **The config and the tokenizer come from shard-1 metadata.** There is no
+  `config.json` in a GGUF directory, so the engine reads the file's own `kimi-k3.*`
+  keys instead, and no `tiktoken.model` either — no `--tok` is needed (and
+  `--config` is refused on this path).
+- **The same streaming economics apply.** The trunk is streamed per layer and
+  dequantised to bf16 into one reusable layer buffer; the routed experts are cached
+  as **backend-native IQ1_S blocks** and dotted directly by a native IQ1_S matmul
+  (`k3_matmul_iq1_s`, math matched to llama.cpp's reference — no requant; the
+  safetensors path keeps its packed MXFP4 experts and kernels unchanged).
+- **Budgets work as usual.** On a 40 GB machine, `--trunk-gb 3 --cache-gb 10` plans
+  17.73 GB and measures 17.84 GB peak RSS. `--layers N` slices are for smoke-testing
+  the machinery only — the run itself prints that its output is NOT the full model.
+- **One honest caveat.** GGUF is a lossy, quantised checkpoint, and this engine is
+  greedy-only — no sampling flags. Two clarifications, kept apart: (1) the
+  repetitive loops seen in early GGUF acceptance runs were a **real bug** — a lossy
+  IQ1_S→MXFP4 requant at cache admit (measured 13% per-element weight error) that
+  flipped the model's top token — now fixed by dotting the native IQ1_S blocks
+  directly (commit `be394b7`), with the rerun verified token-for-token against an
+  independent llama.cpp reference (20/20, starting at the first token). (2) Greedy
+  decoding on a 1-bit checkpoint can still be less diverse than a sampling-based
+  decode; that is a statement about sampling regimes, not engine correctness, and
+  it is not a measured result here.
+- **A head-to-head against the reference runner.** On this box (39-41 GB RAM, warm
+  host cache), a templated run — the model's own chat template, byte-identical
+  99-token prompt, greedy both engines — produced **40/40 identical tokens** against
+  llama.cpp PR #26185 at **60.0 vs 306.6 s/token decode (5.1×)** and **18.2 vs
+  39.9 GB peak RSS (2.2× leaner; llama.cpp pinned at the machine ceiling)**. The
+  why, in one line: llama.cpp mmaps the whole 110 GB GGUF and re-faults ~40 GB
+  through its page cache every step, while this engine streams the same weights
+  through bounded per-layer and expert buffers. Honest scope: one box, one 40-token
+  run, all of it mid-thought inside the model's thinking channel — a
+  faithfulness/token-equality benchmark, not a code-quality or portability claim.
+
+The GGUF path is covered by the weightless parity gates — `make parity-tiny`,
+`test_gguf_gate` and `make tok-gguf` — which prove argmax-identical logits on single
+and multi-shard tiny fixtures within the repo budget, a bit-exact trunk sub-gate
+against the safetensors bytes, and a per-expert GATE 2 comparing the native IQ1_S dot
+against a **raw fp32 dequant reference** (rel-L2 ~5e-7 against a 1e-4 budget — the
+reference is deliberately not a requant mirror).
+
 ## Choosing a preset
 
 ```console
@@ -581,6 +636,12 @@ hour in. Shorten the request, or drop `--incremental`, which carries no KV cache
 
 **Is the whole 1.56 TB needed?** For generation, yes. For development, no: `make test`
 needs nothing at all, and `--layers N` runs against partial shard sets.
+
+**Can I run from a GGUF checkpoint?** Yes — point the engine at a GGUF shard directory
+(or a single `.gguf` file) and both the config and the tokenizer come from shard-1
+metadata automatically: no pack step, no `config.json`, no `--tok`. See
+[GGUF checkpoints](#gguf-checkpoints) for the command and the honest caveat about
+greedy decoding on a quantised checkpoint.
 
 **macOS, Windows, WSL?** The engine targets Linux. The tokenizer and config reader are
 portable C99 and are built portably in CI.

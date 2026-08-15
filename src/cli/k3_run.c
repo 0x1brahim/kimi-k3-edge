@@ -13,8 +13,9 @@
  *   instead, which comes from
  *   getrusage after the run. Fully resident, the weights are 108.81 GB of bf16 trunk plus
  *   4.70 GB of embed and lm_head, so 113.49 GB; streamed, the resident set is whatever
- *   budget is given, down to about 8.2 GB. The 1.45 TB of routed experts is never
- *   resident at any budget.
+ *   budget is given, down to about 8.2 GB. The routed experts (1.45 TB in the
+ *   ST cache's MXFP4 encoding, 0.53 TB as native IQ1_S on the GGUF path) are
+ *   never resident at any budget.
  *
  * THIS ENGINE IS I/O BOUND at small budgets and roughly balanced at large ones. The
  *   measured I/O share runs 40.9%-60.6% across the 12-rung ladder (docs/data/), dropping
@@ -57,6 +58,9 @@
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_gguf.h"  /* .gguf routing: model dir probe, --tok from metadata    */
+#include "k3_gguf_map.h"   /* gguf name map + streamed layer bind (dev-c)       */
+#include "k3_gguf_expert.h" /* gguf expert source (dev-c)                       */
 
 static double now_s(void)
 {
@@ -313,6 +317,10 @@ static void usage(FILE *f)
 "\n"
 "usage: k3 <model_dir> [options]\n"
 "\n"
+"model_dir: a safetensors directory, a GGUF shard directory (holding\n"
+"           *-00001-of-*.gguf), or a single .gguf file. A GGUF model supplies\n"
+"           the tokenizer from its shard-1 metadata when --tok is not given.\n"
+"\n"
 "prompt (exactly one):\n"
 "  --prompt TEXT         tokenize TEXT and run it\n"
 "  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
@@ -346,7 +354,10 @@ static void usage(FILE *f)
 "                        serial decode by construction; needs --incremental. An extra\n"
 "                        verified position costs ~22%% of a serial token when the trunk\n"
 "                        streams, so repetitive text decodes up to several times faster\n"
-"  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
+"  --tok DIR             tokenizer directory (tiktoken.model and\n"
+"                        tokenizer_config.json); a GGUF shard directory or a\n"
+"                        single .gguf file is accepted too and reads the\n"
+"                        tokenizer from the GGUF metadata\n"
 "\n"
 "diagnostics:\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
@@ -448,6 +459,8 @@ typedef struct {
     K3ModelBind  mb;
     int          n_bound;
     K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
+    K3GgufBind  *gguf;       /* non-NULL on the GGUF path: per-layer bind source  */
+    K3ExpertSrc *exp_src;    /* non-NULL on the GGUF path: replaces the K3Cache  */
     /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
      * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
     float       *kvc, *ropec;
@@ -495,11 +508,19 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                 return -1;
             }
             k3_trunk_prefetch(w->trunk, L + 1);
+        } else if (w->gguf) {
+            /* GGUF: refill the reusable layer buffer and re-point every tensor.
+             * k3_bind_layer_mem memsets K3LayerBind first, so no pointer from a
+             * previous layer can survive into this one. */
+            if (k3_gguf_bind_layer(w->gguf, L, &w->lay[L]) != 0) {
+                fprintf(stderr, "gguf bind failed at layer %d\n", L);
+                return -1;
+            }
         }
         /* Point this layer's MoE at the cache before use. Doing it here rather than at
          * bind time keeps K3LayerBind independent of any particular cache. */
         if (w->lay[L].lay.moe) {
-            w->lay[L].moe.src = &cache->src;
+            w->lay[L].moe.src = w->exp_src ? w->exp_src : &cache->src;
             w->lay[L].moe.layer = L;
             /* The draft routes only among resident experts, reading zero new expert bytes;
              * the exact model keeps true routing. This is what makes a draft step cheap. */
@@ -569,6 +590,10 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
+    /* Cheap (stat + one readdir): routes the tokenizer source and, once the io
+     * side lands, the weight reader. A GGUF model has no config.json, so the
+     * tokenizer must come from shard-1 metadata when --tok is absent. */
+    const int gguf_model = k3_gguf_probe(dir);
     const char *ids_s = NULL, *outp = "k3_run.json", *trunk_dir = NULL;
     /* Expert-cache diagnostics are opt-in. They are only meaningful for cache research,
      * and writing them unconditionally drops two undeclared files into whatever
@@ -719,7 +744,29 @@ int main(int argc, char **argv)
     /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
      * refuses a config that would overrun it rather than truncating the layer map. */
     K3Cfg c; static int fa[128];
-    if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
+    K3Gguf gg; memset(&gg, 0, sizeof gg);
+    if (gguf_model) {
+        /* D5: a GGUF model's config comes from the shard-1 metadata, never from a
+         * config.json (the directory has none) and never from a hardcoded table. An
+         * explicit --config is refused: honouring it would silently run a DIFFERENT
+         * architecture than the file's kimi-k3.* keys describe. */
+        if (cfg_path) {
+            fprintf(stderr, "--config is not supported on the GGUF path: the config "
+                            "comes from the shard-1 metadata (D5).\n");
+            return 2;
+        }
+        const size_t dl = strlen(dir);
+        const int single = dl > 5 && !strcmp(dir + dl - 5, ".gguf");
+        if ((single ? k3_gguf_open_file(&gg, dir) : k3_gguf_open(&gg, dir)) != 0) {
+            fprintf(stderr, "ABORTED: the GGUF shard set could not be read.\n");
+            return 1;
+        }
+        if (!k3_gguf_cfg(&gg, &c, fa, 128)) {
+            fprintf(stderr, "ABORTED: the GGUF shard-1 config could not be read with "
+                            "confidence.\n");
+            return 2;
+        }
+    } else if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
         return 2;
     }
@@ -744,12 +791,21 @@ int main(int argc, char **argv)
     Tok tok; int have_tok = 0;
 
     if (prompt_text || prompt_file) {
-        if (!tok_dir) {
+        if (tok_dir) {
+            /* --tok accepts either the HF file pair or a GGUF metadata source. */
+            if (k3_gguf_probe(tok_dir)) k3_tok_load_gguf(&tok, tok_dir);
+            else                       k3_tok_load(&tok, tok_dir);
+        } else if (gguf_model) {
+            /* No --tok and the model is GGUF: the tokenizer lives in shard-1
+             * metadata (D6). Reuse the shard set already opened for the config
+             * gate above instead of re-walking all 14 headers. */
+            k3_tok_load_gguf_from(&tok, &gg);
+        } else {
             fprintf(stderr, "--prompt/--prompt-file need --tok DIR (the directory with "
-                            "tiktoken.model and tokenizer_config.json)\n");
+                            "tiktoken.model and tokenizer_config.json); a GGUF model "
+                            "dir supplies the tokenizer from its own metadata\n");
             return 2;
         }
-        k3_tok_load(&tok, tok_dir);
         have_tok = 1;
 
         char *ptext = NULL; long plen = 0;
@@ -837,15 +893,28 @@ int main(int argc, char **argv)
 
     K3St st;
     double t0 = now_s();
-    if (k3_st_open(&st, dir) != 0) return 1;
-    printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard, now_s() - t0);
+    if (gguf_model) {
+        /* Already opened for the shard-1 config above; the index is the same
+         * object. The tensors are resolved through the contract table, so the
+         * per-layer planning below doubles as the fail-loud shape gate. */
+        printf("indexed %d tensors from %d shards in %.2f s\n", gg.nt, gg.nshard,
+               now_s() - t0);
+    } else {
+        if (k3_st_open(&st, dir) != 0) return 1;
+        printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard,
+               now_s() - t0);
+    }
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
     const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
+    K3GgufBind bind;
+    memset(&bind, 0, sizeof bind);
+    if (gguf_model && k3_gguf_bind_init(&bind, &gg, &c) != 0) return 1;
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
-        const int64_t n = k3_bind_layer_bytes(&st, &c, L);
+        const int64_t n = gguf_model ? k3_gguf_layer_bytes(&bind, L)
+                                     : k3_bind_layer_bytes(&st, &c, L);
         if (n < 0) { missing++; continue; }
         total += n;
     }
@@ -861,6 +930,9 @@ int main(int argc, char **argv)
     if (trunk_dir)
         printf("trunk on disk : %s total (STREAMED from %s, not held in RAM)\n",
                b1, trunk_dir);
+    else if (gguf_model)
+        printf("gguf trunk    : %s total (STREAMED per layer from the GGUF shards;\n"
+               "  Q8_0 dequantized to bf16 into ONE reusable layer buffer)\n", b1);
     else
         printf("resident trunk: %s in RAM (large matrices kept in the checkpoint's bf16,\n"
                "  fp32 only for the norms and biases that kernels read elementwise)\n", b1);
@@ -870,7 +942,13 @@ int main(int argc, char **argv)
      * numbers side by side says exactly what box this needs. */
     {
         const int64_t E64 = c.hidden;
-        const double w_trunk = trunk_dir ? trunk_gb * 1e9 : (double)total;
+        /* On the GGUF path the "trunk" is the single reusable layer buffer,
+         * sized for the LARGEST layer; the rest of the trunk streams through it
+         * one layer at a time. The --trunk-gb gate for it fires in
+         * k3_gguf_bind_alloc, below; the plan reports the actual allocation. */
+        const double w_trunk = gguf_model
+            ? (double)k3_gguf_layer_bytes_max(&bind, NL)
+            : (trunk_dir ? trunk_gb * 1e9 : (double)total);
         const double w_model = 2.0 * (double)c.vocab * E64 * 2    /* embed + lm_head, bf16 */
                              + 3.0 * E64 * 4;                     /* norms, aggregator */
         const double w_cache = cache_gb * 1e9;
@@ -904,7 +982,9 @@ int main(int argc, char **argv)
         printf("  trunk %-10s %s\n  embed + lm_head  %s\n  expert cache     %s\n"
                "  recurrent state  %s\n  buffers          %s\n  KV cache         %s\n"
                "  TOTAL            %s\n",
-               trunk_dir ? "(STREAMED)" : "(resident)", b1, b2, b3, b4, b5, b7, b6);
+               trunk_dir ? "(STREAMED)" : gguf_model ? "(GGUF layer buf)"
+                                                     : "(resident)",
+               b1, b2, b3, b4, b5, b7, b6);
         if (have > 0.0) {
             human(have, b1, sizeof b1);
             printf("  available        %s\n", b1);
@@ -927,6 +1007,15 @@ int main(int argc, char **argv)
 
     static K3Trunk trunk;
     t0 = now_s();
+    if (trunk_dir && gguf_model) {
+        /* The GGUF shards ARE the trunk: there is no trunk.bin for a GGUF model,
+         * and honouring --trunk would silently run the safetensors trunk against
+         * the GGUF config. Refuse rather than guess. */
+        fprintf(stderr, "--trunk is not supported on the GGUF path: the GGUF "
+                        "shards are streamed directly (dev-c), no packed trunk "
+                        "exists for them.\n");
+        return 2;
+    }
     if (trunk_dir) {
         /* STREAMED. Nothing is bound up front: each layer is read from the packed trunk
          * on fast local storage as the forward pass reaches it. RAM stops being a floor
@@ -941,6 +1030,16 @@ int main(int argc, char **argv)
         w.trunk = &trunk;
         w.n_bound = NL;
         printf("trunk streaming enabled from %s in %.1f s\n", trunk_dir, now_s() - t0);
+    } else if (gguf_model) {
+        /* GGUF: same per-layer streaming, but the tensors live in the shards, so
+         * there is no trunk.bin and no pack step. One reusable buffer is sized for
+         * the biggest layer and must fit the --trunk-gb budget; each forward pass
+         * refills it via the contract-table finder (k3_gguf_map.c). */
+        if (k3_gguf_bind_alloc(&bind, NL, (int64_t)(trunk_gb * 1e9)) != 0) return 1;
+        w.gguf = &bind;
+        w.n_bound = NL;
+        printf("gguf layer streaming enabled from %d shards (Q8_0 dequantized on "
+               "bind) in %.1f s\n", gg.nshard, now_s() - t0);
     } else {
         for (int L = 0; L < NL; L++) {
             if (k3_bind_layer(&st, &c, L, &w.lay[L]) != 0) {
@@ -958,22 +1057,45 @@ int main(int argc, char **argv)
     }
 
     t0 = now_s();
-    if (k3_bind_model(&st, &c, 1, &w.mb) != 0) return 1;
+    if (gguf_model ? k3_gguf_bind_model(&bind, 1, &w.mb) != 0
+                   : k3_bind_model(&st, &c, 1, &w.mb) != 0)
+        return 1;
     human((double)w.mb.nbytes, b1, sizeof b1);
     printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
 
     K3Cache cache;
-    if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    K3GgufExpertSrc gesrc;
+    memset(&cache, 0, sizeof cache);
+    memset(&gesrc, 0, sizeof gesrc);
+    if (gguf_model) {
+        /* fix wave: the GGUF expert source stores the IQ1_S slices AS-IS (no
+         * requant) and k3_matmul_iq1_s consumes the slot bytes natively. */
+        if (k3_gguf_expert_src_init(&gesrc, &gg, &c, (int64_t)(cache_gb * 1e9)) != 0)
+            return 1;
+        w.exp_src = &gesrc.src;
+    } else if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0)
+        return 1;
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);
         printf("peak RSS after loading weights: %s  (the plan above is a forecast, "
                "this is measured)\n", rb);
     }
-    printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
-           cache.nslot, (double)cache.slot_bytes / 1e6,
-           (double)cache.nslot * cache.slot_bytes / 1e9,
-           100.0 * cache.nslot / (double)(92 * c.n_experts));
+    {
+        const int nslot = gguf_model ? gesrc.nslot : cache.nslot;
+        const double slotb = gguf_model ? (double)gesrc.slot_bytes
+                                        : (double)cache.slot_bytes;
+        /* the pool size is backend-dependent: the ST cache's MXFP4 experts are
+         * 17.55 MB each (1.45 TB total); the GGUF source's native IQ1_S slots
+         * are 6.45 MB (0.53 TB total on disk). Compute it from the real
+         * geometry rather than printing a fixed number. */
+        const double pool_gb =
+            gguf_model ? (double)92 * c.n_experts * slotb / 1e9 : 1.45e3;
+        printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the %.2f TB "
+               "expert pool)\n\n",
+               nslot, slotb / 1e6, (double)nslot * slotb / 1e9,
+               100.0 * nslot / (double)(92 * c.n_experts), pool_gb / 1e3);
+    }
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
@@ -1191,7 +1313,8 @@ int main(int argc, char **argv)
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0;
     for (int g = 0; nout < gen; g++) {
-        k3_cache_reset_stats(&cache);
+        if (gguf_model) k3_gguf_expert_src_reset_stats(&gesrc);
+        else k3_cache_reset_stats(&cache);
         const double ts = now_s();
         int frc;
         int emit[K3_SPEC_MAX + 1];
@@ -1331,16 +1454,22 @@ int main(int argc, char **argv)
         }
         const double dt = now_s() - ts;
         t_total += dt;
-        const uint64_t req = cache.hits + cache.misses;
+        /* The GGUF path's expert source keeps the same counter fields as the
+         * K3Cache, so the per-step accounting reads whichever is live. */
+        const uint64_t req = gguf_model ? gesrc.hits + gesrc.misses
+                                        : cache.hits + cache.misses;
         printf("%-6d %-10d %-12.2f %-10.1f %-10.2f %.3f\n", g, nxt, dt,
-               req ? 100.0 * cache.hits / req : 0.0,
-               (double)cache.bytes_read / 1e9, 1.0 / dt);
+               req ? 100.0 * (gguf_model ? gesrc.hits : cache.hits) / req : 0.0,
+               (double)(gguf_model ? gesrc.bytes_read : cache.bytes_read) / 1e9,
+               1.0 / dt);
         fflush(stdout);
         /* Roll the per-step figures up before the next reset wipes them. */
-        expert_s_total     += cache.load_seconds;
-        expert_gb_total    += (double)cache.bytes_read / 1e9;
-        expert_reqs_total  += cache.hits + cache.misses;
-        expert_evict_total += cache.evictions;
+        expert_s_total += gguf_model ? gesrc.load_seconds : cache.load_seconds;
+        expert_gb_total += (double)(gguf_model ? gesrc.bytes_read
+                                               : cache.bytes_read) / 1e9;
+        expert_reqs_total += gguf_model ? gesrc.hits + gesrc.misses
+                                        : cache.hits + cache.misses;
+        expert_evict_total += gguf_model ? gesrc.evictions : cache.evictions;
         for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
             seq[T++] = emit[i];
             outtok[nout++] = emit[i];
@@ -1397,7 +1526,6 @@ int main(int argc, char **argv)
         human(peak_rss_bytes(), rb, sizeof rb);
         printf("PEAK RSS for the whole run: %s   <- quote this, not the plan\n\n", rb);
     }
-    k3_cache_report(&cache, "final step");
 
     FILE *f = fopen(outp, "w");
     if (f) {
@@ -1412,11 +1540,17 @@ int main(int argc, char **argv)
         printf("\nwrote %s\n", outp);
     }
     if (trace_dir) {
-        char p[4096];
-        snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
-        k3_cache_dump_hist(&cache, p);
-        snprintf(p, sizeof p, "%s/expert_trace.bin", trace_dir);
-        k3_cache_dump_trace(&cache, p);
+        if (gguf_model) {
+            fprintf(stderr, "--dump-cache-trace is not supported on the GGUF path: "
+                            "the access trace and histogram live in the safetensors "
+                            "K3Cache.\n");
+        } else {
+            char p[4096];
+            snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
+            k3_cache_dump_hist(&cache, p);
+            snprintf(p, sizeof p, "%s/expert_trace.bin", trace_dir);
+            k3_cache_dump_trace(&cache, p);
+        }
     }
 
     free(w.kvc); free(w.ropec); free(w.mla_slot);
@@ -1428,7 +1562,11 @@ int main(int argc, char **argv)
      * change. Those two have opposite tuning implications, and only a direct measurement
      * separates them. */
     {
-        const double trunk_s = w.trunk ? w.trunk->load_seconds : 0.0;
+        /* On the GGUF path the layer stream is the bind itself (reads + dequant
+         * inside k3_gguf_bind_layer); its wall time stands in for the trunk I/O
+         * term. */
+        const double trunk_s = w.trunk ? w.trunk->load_seconds
+                            : w.gguf  ? k3_gguf_bind_load_seconds(w.gguf) : 0.0;
         /* Both terms MUST be whole-run totals over the same window. Mixing a cumulative
          * trunk time with a last-step expert time and dividing by the whole run
          * understates the expert share by roughly the token count. */
@@ -1465,11 +1603,19 @@ int main(int argc, char **argv)
                (unsigned long long)expert_evict_total);
     }
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
-    k3_cache_free(&cache);
+    if (gguf_model) k3_gguf_expert_src_report(&gesrc, "final step");
+    else k3_cache_report(&cache, "final step");
+    if (gguf_model) k3_gguf_expert_src_free(&gesrc);
+    else k3_cache_free(&cache);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
     free(w.lay);
     k3_bind_model_free(&w.mb);
-    k3_st_close(&st);
+    if (gguf_model) {
+        k3_gguf_bind_free(&bind);
+        k3_gguf_close(&gg);
+    } else {
+        k3_st_close(&st);
+    }
     free(h); free(br); free(ks); free(sc); free(lg);
 
     /* A dropped expert means some token was computed with part of its routed sum

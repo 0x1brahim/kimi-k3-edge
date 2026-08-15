@@ -25,6 +25,8 @@
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  */
 #include "k3.h"
+#include "k3_gguf_dequant.h"
+#include "iq1s_grid.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -584,10 +586,17 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             w->src->getmany(w->src, w->layer, idx, nk);
         for (int j = 0; j < nk; j++) {
             if (w->src) {
-                /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. In
-                 * cache-only mode every idx[j] is known resident, so resident() serves it
-                 * with no disk read; otherwise get() may read it. */
+                /* Streamed: the expert stays in its backend-native encoding and
+                 * the matmul reads it directly (MXFP4 nibbles for the ST cache,
+                 * raw IQ1_S blocks for the GGUF source). In cache-only mode
+                 * every idx[j] is known resident, so resident() serves it with
+                 * no disk read; otherwise get() may read it. */
                 K3ExpertQ q;
+                /* wfmt is a source-set tag: k3_cache.c (ST, MXFP4) never
+                 * writes it, so zero is the MXFP4 default by construction and
+                 * the ST path is untouched; the GGUF source sets K3_EXPERT_IQ1S.
+                 * Zeroing here is what makes the ST cache's silence safe. */
+                memset(&q, 0, sizeof q);
                 int miss = w->cache_only
                     ? !w->src->resident(w->src, w->layer, idx[j], &q)
                     : (w->src->get(w->src, w->layer, idx[j], &q) != 0);
@@ -603,10 +612,25 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                                     "this token is CORRUPT\n", w->layer, idx[j]);
                     continue;
                 }
-                k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                if (q.wfmt == K3_EXPERT_IQ1S) {
+                    k3_matmul_iq1_s(gu,     z, q.p1, L, I);
+                    k3_matmul_iq1_s(gu + I, z, q.p3, L, I);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    k3_matmul_iq1_s(edn, act, q.p2, I, L);
+                } else if (q.wfmt == K3_EXPERT_MXFP4) {
+                    k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+                } else {
+                    /* unknown encoding tag: multiplying whatever bytes the
+                     * pointers reference would be silent corruption */
+                    k3_expert_drops++;
+                    fprintf(stderr, "EXPERT DROP: layer %d expert %d has unknown "
+                                    "encoding tag %d; this token is CORRUPT\n",
+                            w->layer, idx[j], q.wfmt);
+                    continue;
+                }
             } else {
                 const float *e1 = w->w1 + (size_t)idx[j] * I * L;   /* gate */
                 const float *e3 = w->w3 + (size_t)idx[j] * I * L;   /* up   */
@@ -735,6 +759,9 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
         K3ExpertQ q;
+        /* zero wfmt (MXFP4 default, see k3_moe): the ST cache never writes the
+         * tag, the GGUF source sets K3_EXPERT_IQ1S */
+        memset(&q, 0, sizeof q);
         if (w->src->get(w->src, w->layer, e, &q) != 0) {
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
@@ -746,10 +773,25 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             const float *zt = zz  + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
-                k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                if (q.wfmt == K3_EXPERT_IQ1S) {
+                    k3_matmul_iq1_s(gu,     zt, q.p1, Ll, I);
+                    k3_matmul_iq1_s(gu + I, zt, q.p3, Ll, I);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    k3_matmul_iq1_s(edn, act, q.p2, I, Ll);
+                } else if (q.wfmt == K3_EXPERT_MXFP4) {
+                    k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
+                    k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                    k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
+                    k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                } else {
+                    /* unknown encoding tag: fail loud, never multiply the
+                     * bytes as if they were a known format */
+                    k3_expert_drops++;
+                    fprintf(stderr, "EXPERT DROP: layer %d expert %d has unknown "
+                                    "encoding tag %d; this chunk is CORRUPT\n",
+                            w->layer, e, q.wfmt);
+                    continue;
+                }
                 memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
             }
         }
@@ -1325,6 +1367,92 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
             acc += sub * (double)K3_E8M0[sb];
         }
         y[r] = (float)acc;
+    }
+}
+
+/* -------------------------------------------------------------- IQ1_S ---- */
+/* y[rows] = W[rows][in] . x[in] with W read directly as RAW IQ1_S blocks - the
+ * GGUF backend's native expert encoding (see K3_EXPERT_IQ1S in k3.h). This is
+ * the correctness kernel of the fix wave: the previous GGUF path dequantized
+ * IQ1_S to fp32 and RE-QUANTIZED to MXFP4 at cache admit, a transform the
+ * reference implementation does not have, measured at 13.3% mean per-element
+ * error on the real bytes (diag-dev). Here the reference's own math is done in
+ * the engine: dequantize per 256-block on the fly, exactly llama.cpp's
+ * dequantize_row_iq1_s (ggml-quants.c:2650) per element, and dot with the
+ * activations, accumulating in fp32 per block and per row - element/block/row
+ * order, the class of llama.cpp's OLDER scalar vec_dot_iq1_s_q8_K (the
+ * PR#26185 tree's generic path accumulates the grid products in int32 and
+ * applies the scales per block; the per-element PRODUCTS are identical in
+ * every variant, and the GATE-2 budget covers the fp32-vs-int32 accumulation
+ * class). The activation side differs by design: llama.cpp
+ * quantizes x to q8_K first; the engine dots the fp32 activations directly, so
+ * agreement with any q8_K reference is fp-accumulation class (~1e-6), not bit
+ * level. test_gguf_par proves the row loop is bit-identical at any thread
+ * count; test_gguf_gate's Gate 2 proves the values against an independent
+ * numpy raw-dequant reference (fixture AND real bytes).
+ *
+ * BLOCK LAYOUT (block_iq1_s, ggml-common.h): per 256 values, ggml_half d +
+ * uint8 qs[32] + uint16 qh[8] = 50 bytes. Per sub-block ib in 0..7:
+ *   dl    = d * (2*((qh[ib] >> 12) & 7) + 1)      sub-block scale, 3 bits
+ *   delta = (qh[ib] & 0x8000) ? -0.125 : 0.125    sign bit 15
+ *   idx   = qs[4*ib + l] | (((qh[ib] >> 3*l) & 7) << 8)   11-bit grid index
+ *   w     = dl * (grid[idx][j] + delta)
+ * Every product is exactly representable in fp32 (d is a widened fp16, dl a
+ * small integer multiple, grid[j]+delta a multiple of 0.125), so the per-element
+ * value here is BIT-IDENTICAL to k3_gguf_dequant's and to the numpy reference;
+ * only the summation order is this kernel's own.
+ *
+ * ROWS ARE INDEPENDENT (same contract as k3_matmul_mxfp4): the OpenMP split is
+ * over whole rows, each row summed by exactly one thread in exactly the order
+ * below, so the output is bit-identical at any thread count. Rows are padded to
+ * the 256-block on disk (ceil(in/256)*50 bytes); the last partial block's
+ * padding contributes nothing (the real file's widths are exact block
+ * multiples; the guard keeps non-multiple widths correct instead of reading
+ * padding as weights). */
+void k3_matmul_iq1_s(float *y, const float *x, const unsigned char *blk,
+                     int in, int rows)
+{
+    const int bpr = (in + K3_GGUF_IQ1_S_QK - 1) / K3_GGUF_IQ1_S_QK;
+    const size_t row_bytes = (size_t)bpr * K3_GGUF_IQ1_S_BSZ;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const unsigned char *row = blk + (size_t)r * row_bytes;
+        float acc = 0.0f;
+        for (int b = 0; b < bpr; b++) {
+            const unsigned char *bl = row + (size_t)b * K3_GGUF_IQ1_S_BSZ;
+            const float d = k3_gguf_f16_to_f32((uint16_t)bl[0] |
+                                               (uint16_t)((uint16_t)bl[1] << 8));
+            const unsigned char *qs = bl + 2;
+            const unsigned char *qh = bl + 2 + K3_GGUF_IQ1_S_QK / 8;
+            const int base = b * K3_GGUF_IQ1_S_QK;
+            float partial = 0.0f;
+            for (int ib = 0; ib < 8; ib++) {
+                const uint16_t qhb = (uint16_t)qh[2 * ib] |
+                                     (uint16_t)((uint16_t)qh[2 * ib + 1] << 8);
+                const float dl = d * (float)(2 * ((qhb >> 12) & 7) + 1);
+                const float delta = (qhb & 0x8000u) ? -0.125f : 0.125f;
+                for (int l = 0; l < 4; l++) {
+                    const uint32_t idx = (uint32_t)qs[4 * ib + l] |
+                                         (((uint32_t)(qhb >> (3 * l)) & 7u) << 8);
+                    const int8_t *grid = (const int8_t *)(iq1s_grid + idx);
+                    const int e = base + 32 * ib + 8 * l;
+                    if (e + 8 <= in) {
+                        /* hot path: whole 8-group inside the row */
+                        for (int j = 0; j < 8; j++)
+                            partial += dl * ((float)grid[j] + delta) * x[e + j];
+                    } else {
+                        /* last partial block: the padding contributes nothing */
+                        for (int j = 0; j < 8 && e + j < in; j++)
+                            partial += dl * ((float)grid[j] + delta) * x[e + j];
+                    }
+                }
+            }
+            acc += partial;
+        }
+        y[r] = acc;
     }
 }
 
