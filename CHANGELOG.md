@@ -21,6 +21,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`k3_matmul_iq1_s`), so the safetensors path keeps its MXFP4 experts and kernels
   unchanged. The dequant/trunk hot loops are OpenMP-parallel with bit-identical
   output at any thread count.
+- **Head-to-head benchmark vs llama.cpp** (PR #26185, the reference runner for the
+  GGUF): templated 40/40 exact token match (greedy both, model's own chat template,
+  byte-identical 99-token prompt), decode 60.0 vs 306.6 s/token (5.1×), peak RSS
+  18.2 vs 39.9 GB (2.2×) — box-specific (39-41 GB RAM, warm host cache), a
+  faithfulness benchmark, not a portability claim.
 - **GGUF parity gates**: weightless tiny-fixture gates for the new path — argmax
   113/113 within the repo budget on single and multi-shard fixtures (single vs
   multi bit-identical), a bit-exact trunk sub-gate against the safetensors bytes,

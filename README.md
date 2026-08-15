@@ -509,7 +509,7 @@ directory; a single `.gguf` file is accepted too:
          --trunk-gb 3 --cache-gb 10
 ```
 
-Four things to know:
+Five things to know:
 
 - **The config and the tokenizer come from shard-1 metadata.** There is no
   `config.json` in a GGUF directory, so the engine reads the file's own `kimi-k3.*`
@@ -533,6 +533,16 @@ Four things to know:
   decoding on a 1-bit checkpoint can still be less diverse than a sampling-based
   decode; that is a statement about sampling regimes, not engine correctness, and
   it is not a measured result here.
+- **A head-to-head against the reference runner.** On this box (39-41 GB RAM, warm
+  host cache), a templated run — the model's own chat template, byte-identical
+  99-token prompt, greedy both engines — produced **40/40 identical tokens** against
+  llama.cpp PR #26185 at **60.0 vs 306.6 s/token decode (5.1×)** and **18.2 vs
+  39.9 GB peak RSS (2.2× leaner; llama.cpp pinned at the machine ceiling)**. The
+  why, in one line: llama.cpp mmaps the whole 110 GB GGUF and re-faults ~40 GB
+  through its page cache every step, while this engine streams the same weights
+  through bounded per-layer and expert buffers. Honest scope: one box, one 40-token
+  run, all of it mid-thought inside the model's thinking channel — a
+  faithfulness/token-equality benchmark, not a code-quality or portability claim.
 
 The GGUF path is covered by the weightless parity gates — `make parity-tiny`,
 `test_gguf_gate` and `make tok-gguf` — which prove argmax-identical logits on single
